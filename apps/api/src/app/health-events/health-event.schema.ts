@@ -34,6 +34,9 @@ export class HealthEvent {
 
   @Prop({ default: 'USER' })
   source: string; // USER, DOCTOR, AI
+
+  @Prop({ index: true })
+  reportGroupId?: string; // Links all events parsed from the same medical report
 }
 
 export const HealthEventSchema = SchemaFactory.createForClass(HealthEvent);

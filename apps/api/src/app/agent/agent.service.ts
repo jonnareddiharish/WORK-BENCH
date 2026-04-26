@@ -1,4 +1,5 @@
 import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { UserService } from '../users/user.service';
 import { ChatAnthropic } from '@langchain/anthropic';
@@ -46,24 +47,57 @@ interface RetrievedChunk {
   date?: string;
 }
 
+interface DoctorInfo {
+  name?: string;
+  hospital?: string;
+  address?: string;
+  specialty?: string;
+}
+
+interface MedicationItem {
+  name: string;
+  dosage: string;
+  frequency: string;
+  duration?: string;
+  route: string;        // ORAL | INJECTION | TOPICAL | IV | OTHER
+  isDaily: boolean;     // tablets/tonics taken at home → also added to diet
+  instructions?: string;
+}
+
+interface TestItem {
+  testName: string;
+  value?: string;
+  referenceRange?: string;
+  interpretation?: string;
+  status: string;       // NORMAL | ABNORMAL | BORDERLINE
+}
+
 interface ParsedHealthData {
-  healthEvents?: {
-    eventType: string;        // DOCTOR_VISIT | DISEASE_DIAGNOSIS | MEDICATION | TREATMENT_START
-    titles: string[];
+  visitDate?: string;
+  doctorInfo?: DoctorInfo;
+  // ONE card: all diagnoses from this visit
+  visitSummary?: {
     description: string;
+    conditions: string[];
+    symptoms?: string[];
+    injections?: string[];  // given at the visit, NOT for home use
+    notes?: string;
     status: string;
-    details?: {
-      doctorName?: string;
-      medicationName?: string;
-      dosage?: string;
-      symptoms?: string[];
-      doctorNotes?: string;
-    };
-  }[];
+  };
+  // ONE card: all prescribed medications
+  prescriptions?: {
+    items: MedicationItem[];
+    status: string;
+  };
+  // ONE card: all test results
+  testResults?: {
+    items: TestItem[];
+    status: string;
+  };
   dietAdvice?: { description: string; mealTypes: string[] }[];
   lifestyleAdvice?: { description: string; categories: string[] }[];
-  newConditions?: string[];   // pushed to user.medicalConditions
-  newMedications?: string[];  // pushed to user.medications
+  newConditions?: string[];
+  newMedications?: string[];
 }
 
 interface AgentState {
@@ -271,25 +305,50 @@ export class AgentService {
   }
 
   private async _parseMedicalReport(message: string, llm: BaseChatModel): Promise<ParsedHealthData> {
-    const systemPrompt =
-      'You are a medical data extraction system. Extract ALL information from the medical report.\n' +
-      'Return ONLY a valid JSON object — no prose, no markdown fences, nothing else.\n\n' +
-      'Required JSON shape:\n' +
-      '{\n' +
-      '  "healthEvents": [\n' +
-      '    One DOCTOR_VISIT event for the consultation:\n' +
-      '    { "eventType": "DOCTOR_VISIT", "titles": ["<Visit type & doctor>"], "description": "<summary>", "status": "ACTIVE", "details": { "doctorName": "<name>", "doctorNotes": "<key findings>" } },\n' +
-      '    One DISEASE_DIAGNOSIS event PER diagnosis/finding:\n' +
-      '    { "eventType": "DISEASE_DIAGNOSIS", "titles": ["<diagnosis>"], "description": "<detail>", "status": "ACTIVE" },\n' +
-      '    One MEDICATION event PER prescribed medication:\n' +
-      '    { "eventType": "MEDICATION", "titles": ["<drug name>"], "description": "<freq, duration, instructions>", "status": "ACTIVE", "details": { "medicationName": "<name>", "dosage": "<dose & frequency>" } }\n' +
-      '  ],\n' +
-      '  "dietAdvice": [ { "description": "<one dietary instruction>", "mealTypes": ["BREAKFAST","LUNCH","DINNER"] } ],\n' +
-      '  "lifestyleAdvice": [ { "description": "<one lifestyle instruction>", "categories": ["EXERCISE","SLEEP","DIET"] } ],\n' +
-      '  "newConditions": ["<each diagnosis as a plain string>"],\n' +
-      '  "newMedications": ["<each medication with dosage as a plain string>"]\n' +
-      '}\n\n' +
-      'IMPORTANT: include EVERY diagnosis, EVERY medication, and EVERY advice item from the report.';
+    const systemPrompt = [
+      'You are a medical data extraction system. Extract ALL information from the medical report.',
+      'Return ONLY a valid JSON object — no prose, no markdown fences, nothing else.\n',
+      'Required JSON shape:',
+      '{',
+      '  "visitDate": "<ISO date string or null>",',
+      '  "doctorInfo": { "name": "<doctor name>", "hospital": "<hospital name>", "address": "<clinic/hospital address>", "specialty": "<specialty>" },',
+      '  "visitSummary": {',
+      '    "description": "<1-2 sentence summary of the visit/procedure>",',
+      '    "conditions": ["<each diagnosis or finding>"],',
+      '    "symptoms": ["<each symptom reported>"],',
+      '    "injections": ["<injection name + dose if administered at visit>"],',
+      '    "notes": "<key clinical findings and doctor notes>",',
+      '    "status": "ACTIVE"',
+      '  },',
+      '  "prescriptions": {',
+      '    "items": [',
+      '      { "name": "<drug name>", "dosage": "<dose>", "frequency": "<frequency>", "duration": "<duration>",',
+      '        "route": "<ORAL|INJECTION|TOPICAL|IV|OTHER>",',
+      '        "isDaily": <true if patient takes at home daily>,',
+      '        "instructions": "<e.g. before meals, with water>" }',
+      '    ],',
+      '    "status": "ACTIVE"',
+      '  },',
+      '  "testResults": {',
+      '    "items": [',
+      '      { "testName": "<test name>", "value": "<result>", "referenceRange": "<ref range>",',
+      '        "interpretation": "<what it means>", "status": "<NORMAL|ABNORMAL|BORDERLINE>" }',
+      '    ],',
+      '    "status": "ACTIVE"',
+      '  },',
+      '  "dietAdvice": [{ "description": "<dietary instruction>", "mealTypes": ["BREAKFAST","LUNCH","DINNER"] }],',
+      '  "lifestyleAdvice": [{ "description": "<lifestyle instruction>", "categories": ["EXERCISE","SLEEP","DIET"] }],',
+      '  "newConditions": ["<each diagnosis as plain string>"],',
+      '  "newMedications": ["<medication name + dose as plain string>"]',
+      '}',
+      '',
+      'RULES:',
+      '- Include EVERY condition, medication, and test from the report',
+      '- isDaily=true for tablets, capsules, tonics, syrups (taken at home); isDaily=false for hospital injections/IV',
+      '- Injections given AT the clinic/hospital go in visitSummary.injections only, NOT in prescriptions',
+      '- Omit "visitSummary", "prescriptions", or "testResults" keys entirely if not present in the report',
+      '- All arrays must be non-empty if the key is present',
+    ].join('\n');
 
     try {
       const res = await llm.invoke([
@@ -297,111 +356,179 @@ export class AgentService {
         new HumanMessage(message),
       ]);
       const parsed = this._extractJson(res.content as string);
-      this.logger.log(`parseMedicalReport: ${parsed.healthEvents?.length ?? 0} events, ${parsed.newConditions?.length ?? 0} conditions, ${parsed.newMedications?.length ?? 0} medications`);
+      this.logger.log(
+        `parseMedicalReport: ${parsed.visitSummary?.conditions?.length ?? 0} conditions, ` +
+        `${parsed.prescriptions?.items?.length ?? 0} medications, ` +
+        `${parsed.testResults?.items?.length ?? 0} tests`
+      );
       return parsed;
     } catch (err: any) {
       this.logger.error('parseMedicalReport failed:', err.message);
-      return { healthEvents: [], dietAdvice: [], lifestyleAdvice: [], newConditions: [], newMedications: [] };
+      return {};
     }
   }
 
   private async _storeReport(userId: string, parsedData: ParsedHealthData): Promise<string> {
     const today = new Date();
-    let savedEvents = 0;
+    const reportGroupId = randomUUID();
+    let savedCards = 0;
+    const dailyMedNames: string[] = [];
 
-    // ── Save all health events (visits, diagnoses, medications) ───────────────
-    for (const event of parsedData?.healthEvents ?? []) {
+    // ── ONE DOCTOR_VISIT card — all diagnoses bundled ─────────────────────────
+    if (parsedData.visitSummary) {
+      const vs = parsedData.visitSummary;
+      const conditionTitle = vs.conditions?.length
+        ? vs.conditions.join(', ').slice(0, 80)
+        : 'Visit Summary';
       try {
-        const titles = event.titles?.length
-          ? event.titles
-          : [event.description?.slice(0, 60) || 'Health Event'];
         const doc = await new this.healthEventModel({
-          eventType:   event.eventType,
-          titles,
-          description: event.description,
-          status:      event.status || 'ACTIVE',
-          details:     event.details ?? {},
-          userId,
-          source: 'AI',
-          date:   today,
+          eventType:   'DOCTOR_VISIT',
+          titles:      [conditionTitle],
+          description: vs.description || conditionTitle,
+          status:      vs.status || 'ACTIVE',
+          details: {
+            doctorInfo: parsedData.doctorInfo ?? {},
+            conditions: vs.conditions  ?? [],
+            symptoms:   vs.symptoms    ?? [],
+            injections: vs.injections  ?? [],
+            notes:      vs.notes       ?? '',
+          },
+          userId, source: 'DOCTOR', date: today, reportGroupId,
         }).save();
-        const text = `${event.eventType} on ${doc.date.toISOString().slice(0, 10)}: ` +
-                     `${titles.join(', ')} — ${event.description} (${event.status})`;
-        await this.embedAndStore(userId, doc._id.toString(), 'HEALTH_EVENT', text, doc.date.toISOString());
-        savedEvents++;
+        await this.embedAndStore(
+          userId, doc._id.toString(), 'HEALTH_EVENT',
+          `DOCTOR_VISIT on ${doc.date.toISOString().slice(0, 10)}: ${conditionTitle}`,
+          doc.date.toISOString()
+        );
+        savedCards++;
       } catch (err: any) {
-        this.logger.error(`store healthEvent [${event.eventType}] error:`, err.message);
+        this.logger.error('store DOCTOR_VISIT error:', err.message);
       }
     }
 
-    // ── Save diet advice ──────────────────────────────────────────────────────
-    let savedDiet = 0;
-    for (const diet of parsedData?.dietAdvice ?? []) {
+    // ── ONE PRESCRIPTION card — all medications bundled ───────────────────────
+    if (parsedData.prescriptions?.items?.length) {
+      const meds = parsedData.prescriptions.items;
+      const medTitle = 'Prescription — ' + meds.map(m => m.name).join(', ').slice(0, 60);
+      try {
+        const doc = await new this.healthEventModel({
+          eventType:   'PRESCRIPTION',
+          titles:      [medTitle],
+          description: `${meds.length} medication(s) prescribed`,
+          status:      parsedData.prescriptions.status || 'ACTIVE',
+          details: {
+            doctorInfo:  parsedData.doctorInfo ?? {},
+            medications: meds,
+          },
+          userId, source: 'DOCTOR', date: today, reportGroupId,
+        }).save();
+        await this.embedAndStore(
+          userId, doc._id.toString(), 'HEALTH_EVENT',
+          `PRESCRIPTION on ${doc.date.toISOString().slice(0, 10)}: ${medTitle}`,
+          doc.date.toISOString()
+        );
+        savedCards++;
+      } catch (err: any) {
+        this.logger.error('store PRESCRIPTION error:', err.message);
+      }
+
+      // Daily oral meds → DietLog PILLS entry
+      for (const med of meds.filter(m => m.isDaily)) {
+        try {
+          const desc =
+            `${med.name} ${med.dosage} — ${med.frequency}` +
+            (med.instructions ? ` (${med.instructions})` : '');
+          await new this.dietLogModel({
+            userId, description: desc, mealTypes: ['PILLS'], source: 'DOCTOR', date: today,
+          }).save();
+          dailyMedNames.push(med.name);
+        } catch (err: any) {
+          this.logger.error('store daily-med diet entry error:', err.message);
+        }
+      }
+    }
+
+    // ── ONE TEST_RESULTS card — all tests bundled ─────────────────────────────
+    if (parsedData.testResults?.items?.length) {
+      const tests = parsedData.testResults.items;
+      const testTitle = 'Tests — ' + tests.map(t => t.testName).join(', ').slice(0, 60);
+      try {
+        const doc = await new this.healthEventModel({
+          eventType:   'TEST_RESULTS',
+          titles:      [testTitle],
+          description: `${tests.length} test result(s)`,
+          status:      parsedData.testResults.status || 'ACTIVE',
+          details:     { testResults: tests },
+          userId, source: 'DOCTOR', date: today, reportGroupId,
+        }).save();
+        await this.embedAndStore(
+          userId, doc._id.toString(), 'HEALTH_EVENT',
+          `TEST_RESULTS on ${doc.date.toISOString().slice(0, 10)}: ${testTitle}`,
+          doc.date.toISOString()
+        );
+        savedCards++;
+      } catch (err: any) {
+        this.logger.error('store TEST_RESULTS error:', err.message);
+      }
+    }
+
+    // ── Diet advice ───────────────────────────────────────────────────────────
+    for (const diet of parsedData.dietAdvice ?? []) {
       try {
         const doc = await new this.dietLogModel({
-          userId, description: diet.description,
-          mealTypes: diet.mealTypes || [], source: 'DOCTOR', date: today,
+          userId, description: diet.description, mealTypes: diet.mealTypes || [],
+          source: 'DOCTOR', date: today,
         }).save();
-        const text = `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${diet.description}`;
-        await this.embedAndStore(userId, doc._id.toString(), 'DIET_LOG', text, doc.date.toISOString());
-        savedDiet++;
+        await this.embedAndStore(
+          userId, doc._id.toString(), 'DIET_LOG',
+          `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${diet.description}`,
+          doc.date.toISOString()
+        );
       } catch (err: any) {
         this.logger.error('storeDietLog error:', err.message);
       }
     }
 
-    // ── Save lifestyle advice ─────────────────────────────────────────────────
-    let savedLifestyle = 0;
-    for (const ls of parsedData?.lifestyleAdvice ?? []) {
+    // ── Lifestyle advice ──────────────────────────────────────────────────────
+    for (const ls of parsedData.lifestyleAdvice ?? []) {
       try {
         const doc = await new this.lifestyleModel({
-          userId, description: ls.description,
-          categories: ls.categories || [], source: 'DOCTOR', date: today,
+          userId, description: ls.description, categories: ls.categories || [],
+          source: 'DOCTOR', date: today,
         }).save();
-        const text = `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${ls.description}`;
-        await this.embedAndStore(userId, doc._id.toString(), 'LIFESTYLE', text, doc.date.toISOString());
-        savedLifestyle++;
+        await this.embedAndStore(
+          userId, doc._id.toString(), 'LIFESTYLE',
+          `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${ls.description}`,
+          doc.date.toISOString()
+        );
       } catch (err: any) {
         this.logger.error('storeLifestyle error:', err.message);
       }
     }
 
-    // ── Update user profile: append new conditions & medications ─────────────
-    const newConditions  = (parsedData?.newConditions  ?? []).filter(Boolean);
-    const newMedications = (parsedData?.newMedications ?? []).filter(Boolean);
+    // ── Update user profile ───────────────────────────────────────────────────
+    const newConditions  = (parsedData.newConditions  ?? []).filter(Boolean);
+    const newMedications = (parsedData.newMedications ?? []).filter(Boolean);
     if (newConditions.length || newMedications.length) {
       try {
         const currentUser = await this.userService.findOne(userId);
         if (currentUser) {
-          const mergedConditions = Array.from(new Set([
-            ...(currentUser.medicalConditions ?? []),
-            ...newConditions,
-          ]));
-          const mergedMedications = Array.from(new Set([
-            ...(currentUser.medications ?? []),
-            ...newMedications,
-          ]));
           await this.userService.update(userId, {
-            medicalConditions: mergedConditions,
-            medications:       mergedMedications,
+            medicalConditions: Array.from(new Set([...(currentUser.medicalConditions ?? []), ...newConditions])),
+            medications:       Array.from(new Set([...(currentUser.medications ?? []), ...newMedications])),
           });
         }
       } catch (err: any) {
-        this.logger.warn('Failed to update user profile conditions/medications:', err.message);
+        this.logger.warn('Failed to update user profile:', err.message);
       }
     }
 
-    const total = savedEvents + savedDiet + savedLifestyle;
-    if (total === 0) return '';
-
-    const parts: string[] = [];
-    if (savedEvents   > 0) parts.push(`${savedEvents} health record${savedEvents > 1 ? 's' : ''}`);
-    if (savedDiet     > 0) parts.push(`${savedDiet} diet note${savedDiet > 1 ? 's' : ''}`);
-    if (savedLifestyle > 0) parts.push(`${savedLifestyle} lifestyle tip${savedLifestyle > 1 ? 's' : ''}`);
-    if (newConditions.length  > 0) parts.push(`${newConditions.length} condition${newConditions.length > 1 ? 's' : ''} added to your profile`);
-    if (newMedications.length > 0) parts.push(`${newMedications.length} medication${newMedications.length > 1 ? 's' : ''} added to your profile`);
-
-    return `Saved: ${parts.join(', ')}.`;
+    if (savedCards === 0) return '';
+    const parts: string[] = [`${savedCards} health record card${savedCards > 1 ? 's' : ''} saved`];
+    if (dailyMedNames.length)  parts.push(`${dailyMedNames.length} daily med${dailyMedNames.length > 1 ? 's' : ''} added to diet`);
+    if (newConditions.length)  parts.push(`${newConditions.length} condition${newConditions.length > 1 ? 's' : ''} added to profile`);
+    if (newMedications.length) parts.push(`${newMedications.length} medication${newMedications.length > 1 ? 's' : ''} added to profile`);
+    return parts.join(', ') + '.';
   }
 
   private _buildProfileText(p: UserProfileSnapshot): string {
@@ -464,85 +591,10 @@ export class AgentService {
       return { parsedData };
     };
 
-    const storeHealthEvents = async (state: AgentState): Promise<Partial<AgentState>> => {
-      const events = state.parsedData?.healthEvents ?? [];
-      for (const event of events) {
-        try {
-          const titles = event.titles?.length
-            ? event.titles
-            : [event.description?.slice(0, 60) || 'Health Event'];
-          const doc = await new this.healthEventModel({
-            ...event, titles, userId: state.userId, source: 'AI', date: new Date(),
-          }).save();
-          const text = `${event.eventType} on ${doc.date.toISOString().slice(0, 10)}: ` +
-                       `${titles.join(', ')} — ${event.description} (${event.status})`;
-          await this.embedAndStore(state.userId, doc._id.toString(), 'HEALTH_EVENT', text, doc.date.toISOString());
-        } catch (err: any) {
-          this.logger.error('storeHealthEvents error:', err.message);
-        }
-      }
-      return events.length ? { storageFeedback: `Saved ${events.length} health record(s).` } : {};
-    };
-
-    const storeDietLogs = async (state: AgentState): Promise<Partial<AgentState>> => {
-      const advice = state.parsedData?.dietAdvice ?? [];
-      for (const diet of advice) {
-        try {
-          const doc = await new this.dietLogModel({
-            userId: state.userId, description: diet.description,
-            mealTypes: diet.mealTypes || [], source: 'DOCTOR', date: new Date(),
-          }).save();
-          const text = `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${diet.description}`;
-          await this.embedAndStore(state.userId, doc._id.toString(), 'DIET_LOG', text, doc.date.toISOString());
-        } catch (err: any) {
-          this.logger.error('storeDietLogs error:', err.message);
-        }
-      }
-      return {};
-    };
-
-    const storeLifestyle = async (state: AgentState): Promise<Partial<AgentState>> => {
-      const advice = state.parsedData?.lifestyleAdvice ?? [];
-      for (const ls of advice) {
-        try {
-          const doc = await new this.lifestyleModel({
-            userId: state.userId, description: ls.description,
-            categories: ls.categories || [], source: 'DOCTOR', date: new Date(),
-          }).save();
-          const text = `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${ls.description}`;
-          await this.embedAndStore(state.userId, doc._id.toString(), 'LIFESTYLE', text, doc.date.toISOString());
-        } catch (err: any) {
-          this.logger.error('storeLifestyle error:', err.message);
-        }
-      }
-
-      // Update user profile with new conditions/medications extracted from report
-      const newConditions  = (state.parsedData?.newConditions  ?? []).filter(Boolean);
-      const newMedications = (state.parsedData?.newMedications ?? []).filter(Boolean);
-      if (newConditions.length || newMedications.length) {
-        try {
-          const currentUser = await this.userService.findOne(state.userId);
-          if (currentUser) {
-            await this.userService.update(state.userId, {
-              medicalConditions: Array.from(new Set([...(currentUser.medicalConditions ?? []), ...newConditions])),
-              medications:       Array.from(new Set([...(currentUser.medications ?? []), ...newMedications])),
-            });
-          }
-        } catch (err: any) {
-          this.logger.warn('Failed to update user profile conditions/medications:', err.message);
-        }
-      }
-
-      const totalStored =
-        (state.parsedData?.healthEvents?.length ?? 0) +
-        (state.parsedData?.dietAdvice?.length ?? 0) +
-        advice.length;
-      const parts: string[] = [`saved ${totalStored} record(s)`];
-      if (newConditions.length)  parts.push(`${newConditions.length} condition(s) added to profile`);
-      if (newMedications.length) parts.push(`${newMedications.length} medication(s) added to profile`);
-      return {
-        storageFeedback: `I've analysed your medical report and ${parts.join(', ')}.`
-      };
+    const storeReportData = async (state: AgentState): Promise<Partial<AgentState>> => {
+      if (!state.parsedData) return {};
+      const feedback = await this._storeReport(state.userId, state.parsedData);
+      return feedback ? { storageFeedback: feedback } : {};
     };
 
     const synthesizeResponse = async (state: AgentState): Promise<Partial<AgentState>> => {
@@ -575,9 +627,7 @@ export class AgentService {
     graphBuilder.addNode('classifyIntent',     classifyIntent);
     graphBuilder.addNode('retrieveContext',    retrieveContext);
     graphBuilder.addNode('parseMedicalReport', parseMedicalReport);
-    graphBuilder.addNode('storeHealthEvents',  storeHealthEvents);
-    graphBuilder.addNode('storeDietLogs',      storeDietLogs);
-    graphBuilder.addNode('storeLifestyle',     storeLifestyle);
+    graphBuilder.addNode('storeReportData',    storeReportData);
     graphBuilder.addNode('synthesizeResponse', synthesizeResponse);
 
     // @ts-ignore
@@ -590,13 +640,9 @@ export class AgentService {
       synthesizeResponse: 'synthesizeResponse',
     });
     // @ts-ignore
-    graphBuilder.addEdge('parseMedicalReport', 'storeHealthEvents');
+    graphBuilder.addEdge('parseMedicalReport', 'storeReportData');
     // @ts-ignore
-    graphBuilder.addEdge('storeHealthEvents',  'storeDietLogs');
-    // @ts-ignore
-    graphBuilder.addEdge('storeDietLogs',      'storeLifestyle');
-    // @ts-ignore
-    graphBuilder.addEdge('storeLifestyle',     'synthesizeResponse');
+    graphBuilder.addEdge('storeReportData',    'synthesizeResponse');
     // @ts-ignore
     graphBuilder.addEdge('synthesizeResponse', END);
 

@@ -30,24 +30,66 @@ import {
   Paperclip,
   ImageIcon,
   FileScan,
+  Stethoscope,
+  Pill,
+  FlaskConical,
+  Link2,
+  MapPin,
+  Building2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ForceGraph2D from 'react-force-graph-2d';
 import './app.css';
 import { MealPlanDashboard } from './MealPlanDashboard';
 
+interface DoctorInfo {
+  name?: string;
+  hospital?: string;
+  address?: string;
+  specialty?: string;
+}
+
+interface MedicationItem {
+  name: string;
+  dosage: string;
+  frequency: string;
+  duration?: string;
+  route: string;
+  isDaily: boolean;
+  instructions?: string;
+}
+
+interface TestItem {
+  testName: string;
+  value?: string;
+  referenceRange?: string;
+  interpretation?: string;
+  status: string; // NORMAL | ABNORMAL | BORDERLINE
+}
+
 interface HealthEvent {
   _id: string;
-  eventType: string;
+  eventType: string; // DOCTOR_VISIT | PRESCRIPTION | TEST_RESULTS | TREATMENT_START
   date: string;
   titles: string[];
   status: string;
   description?: string;
   source?: string;
+  reportGroupId?: string;
   details?: {
+    // DOCTOR_VISIT
+    doctorInfo?: DoctorInfo;
+    conditions?: string[];
+    symptoms?: string[];
+    injections?: string[];
+    notes?: string;
+    // PRESCRIPTION
+    medications?: MedicationItem[];
+    // TEST_RESULTS
+    testResults?: TestItem[];
+    // Legacy fields
     doctorName?: string;
     doctorNotes?: string;
-    symptoms?: string[];
   };
 }
 
@@ -1515,7 +1557,7 @@ function UserDashboard() {
 
         <div className="col-span-1 space-y-6">
           <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
-            <div 
+            <div
               className="flex items-center justify-between mb-4 cursor-pointer group/header"
               onClick={() => navigate(`/users/${userId}/health-notes`)}
             >
@@ -1524,13 +1566,13 @@ function UserDashboard() {
             </div>
 
             <div className="flex bg-slate-100 p-1 rounded-xl mb-4">
-              <button 
+              <button
                 onClick={() => setHealthTab('USER')}
                 className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${healthTab === 'USER' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
               >
                 My Logs
               </button>
-              <button 
+              <button
                 onClick={() => setHealthTab('DOCTOR')}
                 className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${healthTab === 'DOCTOR' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
               >
@@ -1538,28 +1580,129 @@ function UserDashboard() {
               </button>
             </div>
 
-            <div className="space-y-3 max-h-[300px] overflow-y-auto pr-2 scrollbar-hide">
-              {healthEvents.filter(e => (e.source || 'USER') === healthTab).length === 0 ? (
-                <p className="text-sm text-slate-400 italic py-4 text-center">No {healthTab === 'USER' ? 'logs' : 'reports'} found.</p>
-              ) : (
-                healthEvents.filter(e => (e.source || 'USER') === healthTab).map(event => (
-                  <div key={event._id} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors relative group/item">
-                    <p className="text-xs text-slate-400 font-medium mb-0.5">
-                      {new Date(event.date).toLocaleDateString()}
-                    </p>
-                    <p className="text-sm font-semibold text-slate-800 line-clamp-1">{(event.titles || []).join(', ')}</p>
-                    <div className="flex items-center space-x-2 mt-1">
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                        event.status === 'ACTIVE' ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'
-                      }`}>
+            <div className="space-y-3 max-h-[360px] overflow-y-auto pr-1 scrollbar-hide">
+              {healthTab === 'USER' ? (
+                (() => {
+                  const userEvents = healthEvents.filter(e => !e.source || e.source === 'USER');
+                  return userEvents.length === 0 ? (
+                    <p className="text-sm text-slate-400 italic py-4 text-center">No logs found.</p>
+                  ) : userEvents.map(event => (
+                    <div key={event._id} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
+                      <p className="text-xs text-slate-400 font-medium mb-0.5">{new Date(event.date).toLocaleDateString()}</p>
+                      <p className="text-sm font-semibold text-slate-800 line-clamp-1">{(event.titles || []).join(', ')}</p>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded mt-1 inline-block ${event.status === 'ACTIVE' ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>
                         {event.status}
                       </span>
-                      {event.source === 'DOCTOR' && (
-                        <span className="text-[10px] font-black bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded border border-indigo-100">DOCTOR</span>
-                      )}
                     </div>
-                  </div>
-                ))
+                  ));
+                })()
+              ) : (
+                // Doctor tab — group by reportGroupId
+                (() => {
+                  const doctorEvents = healthEvents
+                    .filter(e => e.source === 'DOCTOR' || e.source === 'AI')
+                    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+                  if (doctorEvents.length === 0)
+                    return <p className="text-sm text-slate-400 italic py-4 text-center">No doctor reports found.</p>;
+
+                  // Build groups: reportGroupId → events; standalone events keyed by _id
+                  const groupMap = new Map<string, HealthEvent[]>();
+                  for (const ev of doctorEvents) {
+                    const key = ev.reportGroupId || ev._id;
+                    if (!groupMap.has(key)) groupMap.set(key, []);
+                    groupMap.get(key)!.push(ev);
+                  }
+
+                  return Array.from(groupMap.entries()).map(([key, events]) => {
+                    const isGroup = !!events[0].reportGroupId;
+                    const visitEvent = events.find(e => e.eventType === 'DOCTOR_VISIT');
+                    const rxEvent   = events.find(e => e.eventType === 'PRESCRIPTION');
+                    const testEvent = events.find(e => e.eventType === 'TEST_RESULTS');
+                    const doctorInfo = visitEvent?.details?.doctorInfo ?? rxEvent?.details?.doctorInfo;
+
+                    if (!isGroup) {
+                      const ev = events[0];
+                      return (
+                        <div key={key} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
+                          <p className="text-xs text-slate-400 font-medium mb-0.5">{new Date(ev.date).toLocaleDateString()}</p>
+                          <p className="text-sm font-semibold text-slate-800 line-clamp-1">{(ev.titles || []).join(', ')}</p>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded mt-1 inline-block ${ev.status === 'ACTIVE' ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                            {ev.eventType || ev.status}
+                          </span>
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div key={key} className="border border-indigo-100 rounded-2xl overflow-hidden bg-indigo-50/30">
+                        {/* Visit group header */}
+                        <div className="px-3 py-2 bg-indigo-50 flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <Link2 className="w-3 h-3 text-indigo-400 flex-shrink-0" />
+                            <span className="text-[9px] font-black text-indigo-500 uppercase tracking-wider">Visit Group</span>
+                            <span className="text-[9px] text-indigo-400">·</span>
+                            <span className="text-[9px] text-indigo-400">{new Date(events[0].date).toLocaleDateString()}</span>
+                          </div>
+                          {doctorInfo?.name && (
+                            <span className="text-[9px] font-semibold text-indigo-600 truncate max-w-[90px] flex-shrink-0">
+                              {doctorInfo.name}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Doctor address row */}
+                        {(doctorInfo?.hospital || doctorInfo?.address) && (
+                          <div className="px-3 py-1.5 flex items-center gap-1.5 border-b border-indigo-100/60 bg-white/60">
+                            <Building2 className="w-3 h-3 text-slate-400 flex-shrink-0" />
+                            <span className="text-[10px] text-slate-500 line-clamp-1">
+                              {[doctorInfo.hospital, doctorInfo.address].filter(Boolean).join(' — ')}
+                            </span>
+                          </div>
+                        )}
+
+                        {/* DOCTOR_VISIT row */}
+                        {visitEvent && (
+                          <div className="px-3 py-2 border-t border-indigo-100/60 flex items-start gap-2">
+                            <Stethoscope className="w-3.5 h-3.5 text-rose-500 mt-0.5 flex-shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Findings</span>
+                              <p className="text-xs font-semibold text-slate-700 line-clamp-2">
+                                {visitEvent.details?.conditions?.join(', ') || visitEvent.titles?.[0]}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* PRESCRIPTION row */}
+                        {rxEvent && (
+                          <div className="px-3 py-2 border-t border-indigo-100/60 flex items-start gap-2">
+                            <Pill className="w-3.5 h-3.5 text-indigo-500 mt-0.5 flex-shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Prescription</span>
+                              <p className="text-xs font-semibold text-slate-700 line-clamp-1">
+                                {rxEvent.details?.medications?.map(m => `${m.name} ${m.dosage}`).join(', ') || rxEvent.titles?.[0]}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* TEST_RESULTS row */}
+                        {testEvent && (
+                          <div className="px-3 py-2 border-t border-indigo-100/60 flex items-start gap-2">
+                            <FlaskConical className="w-3.5 h-3.5 text-emerald-500 mt-0.5 flex-shrink-0" />
+                            <div className="min-w-0 flex-1">
+                              <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Tests</span>
+                              <p className="text-xs font-semibold text-slate-700 line-clamp-1">
+                                {testEvent.details?.testResults?.map(t => t.testName).join(', ') || testEvent.titles?.[0]}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  });
+                })()
               )}
             </div>
           </div>
@@ -2124,8 +2267,224 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
       </div>
 
       {viewMode === 'board' ? (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          {draftNote && (
+        <div className={`${endpoint === 'health-events' ? '' : 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8'}`}>
+          {/* Health events: grouped + ungrouped cards side by side */}
+          {endpoint === 'health-events' && (() => {
+            const healthRecs = records as (RecordItem & {
+              source?: string; reportGroupId?: string; details?: HealthEvent['details']; eventType?: string;
+            })[];
+
+            const groupMap = new Map<string, typeof healthRecs>();
+            for (const rec of healthRecs) {
+              if (rec.source === 'DOCTOR' || rec.source === 'AI') {
+                const key = rec.reportGroupId || rec._id;
+                if (!groupMap.has(key)) groupMap.set(key, []);
+                groupMap.get(key)!.push(rec);
+              }
+            }
+            const userRecs = healthRecs.filter(r => !r.source || r.source === 'USER');
+
+            return (
+              <div className="space-y-6">
+                {/* Visit groups (doctor/AI) */}
+                {groupMap.size > 0 && (
+                  <div>
+                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Doctor Reports</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                      {Array.from(groupMap.entries()).map(([key, evs]) => {
+                        const isGroup = !!evs[0].reportGroupId;
+                        const visitEv = evs.find(e => e.eventType === 'DOCTOR_VISIT');
+                        const rxEv    = evs.find(e => e.eventType === 'PRESCRIPTION');
+                        const testEv  = evs.find(e => e.eventType === 'TEST_RESULTS');
+                        const docInfo: DoctorInfo = visitEv?.details?.doctorInfo ?? rxEv?.details?.doctorInfo ?? {};
+
+                        return (
+                          <div key={key} className={`rounded-3xl border-2 shadow-sm overflow-hidden ${isGroup ? 'border-indigo-200 bg-gradient-to-b from-indigo-50 to-white' : 'border-slate-200 bg-white'} hover:shadow-xl hover:-translate-y-0.5 transition-all`}>
+                            {/* Card Header */}
+                            <div className={`px-5 py-4 ${isGroup ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-700'}`}>
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                  {isGroup && <Link2 className="w-4 h-4 text-indigo-200" />}
+                                  <span className="text-xs font-black uppercase tracking-wider">
+                                    {isGroup ? 'Visit Group' : (evs[0].eventType || 'Health Event')}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] opacity-70">{new Date(evs[0].date).toLocaleDateString()}</span>
+                              </div>
+                              {/* Doctor info */}
+                              {docInfo.name && (
+                                <p className={`text-sm font-bold mt-1 ${isGroup ? 'text-white' : 'text-slate-800'}`}>
+                                  {docInfo.specialty ? `${docInfo.name} · ${docInfo.specialty}` : docInfo.name}
+                                </p>
+                              )}
+                              {(docInfo.hospital || docInfo.address) && (
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  <MapPin className={`w-3 h-3 flex-shrink-0 ${isGroup ? 'text-indigo-300' : 'text-slate-400'}`} />
+                                  <p className={`text-[10px] line-clamp-1 ${isGroup ? 'text-indigo-200' : 'text-slate-500'}`}>
+                                    {[docInfo.hospital, docInfo.address].filter(Boolean).join(' — ')}
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* DOCTOR_VISIT section */}
+                            {visitEv && (
+                              <div className="px-5 py-3 border-b border-indigo-100">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <Stethoscope className="w-4 h-4 text-rose-500 flex-shrink-0" />
+                                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">Diagnoses & Findings</span>
+                                </div>
+                                {(visitEv.details?.conditions ?? []).length > 0 ? (
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {visitEv.details!.conditions!.map((c, i) => (
+                                      <span key={i} className="px-2 py-0.5 bg-rose-50 text-rose-700 text-[10px] font-bold rounded-full border border-rose-100">{c}</span>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <p className="text-xs text-slate-500 line-clamp-2">{visitEv.description}</p>
+                                )}
+                                {(visitEv.details?.symptoms ?? []).length > 0 && (
+                                  <p className="text-[10px] text-slate-400 mt-1.5">Symptoms: {visitEv.details!.symptoms!.join(', ')}</p>
+                                )}
+                                {(visitEv.details?.injections ?? []).length > 0 && (
+                                  <p className="text-[10px] text-amber-600 mt-1 font-medium">Injections given: {visitEv.details!.injections!.join(', ')}</p>
+                                )}
+                                {visitEv.details?.notes && (
+                                  <p className="text-[10px] text-slate-400 mt-1 italic line-clamp-2">{visitEv.details.notes}</p>
+                                )}
+                              </div>
+                            )}
+
+                            {/* PRESCRIPTION section */}
+                            {rxEv && (rxEv.details?.medications ?? []).length > 0 && (
+                              <div className="px-5 py-3 border-b border-indigo-100">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <Pill className="w-4 h-4 text-indigo-500 flex-shrink-0" />
+                                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">Prescription</span>
+                                </div>
+                                <div className="space-y-1.5">
+                                  {rxEv.details!.medications!.map((med, i) => (
+                                    <div key={i} className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <span className="text-xs font-bold text-slate-800">{med.name}</span>
+                                        <span className="text-[10px] text-slate-500 ml-1">{med.dosage}</span>
+                                        {med.duration && <span className="text-[10px] text-slate-400 ml-1">· {med.duration}</span>}
+                                      </div>
+                                      <div className="flex items-center gap-1 flex-shrink-0">
+                                        {med.isDaily && (
+                                          <span className="text-[9px] font-bold px-1.5 py-0.5 bg-teal-50 text-teal-600 rounded-full border border-teal-100">DAILY</span>
+                                        )}
+                                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${
+                                          med.route === 'INJECTION' ? 'bg-amber-50 text-amber-600 border-amber-100' : 'bg-slate-50 text-slate-500 border-slate-100'
+                                        }`}>{med.route || 'ORAL'}</span>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* TEST_RESULTS section */}
+                            {testEv && (testEv.details?.testResults ?? []).length > 0 && (
+                              <div className="px-5 py-3">
+                                <div className="flex items-center gap-2 mb-2">
+                                  <FlaskConical className="w-4 h-4 text-emerald-500 flex-shrink-0" />
+                                  <span className="text-[10px] font-black uppercase tracking-wider text-slate-500">Test Results</span>
+                                </div>
+                                <div className="space-y-1.5">
+                                  {testEv.details!.testResults!.map((t, i) => (
+                                    <div key={i} className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <span className="text-xs font-semibold text-slate-700">{t.testName}</span>
+                                        {t.value && <span className="text-[10px] text-slate-500 ml-1">: {t.value}</span>}
+                                        {t.referenceRange && <span className="text-[10px] text-slate-400 ml-1">(ref: {t.referenceRange})</span>}
+                                      </div>
+                                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border flex-shrink-0 ${
+                                        t.status === 'ABNORMAL'   ? 'bg-rose-50 text-rose-600 border-rose-100' :
+                                        t.status === 'BORDERLINE' ? 'bg-amber-50 text-amber-600 border-amber-100' :
+                                                                     'bg-emerald-50 text-emerald-600 border-emerald-100'
+                                      }`}>{t.status || 'N/A'}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Fallback for non-grouped or legacy events */}
+                            {!visitEv && !rxEv && !testEv && (
+                              <div className="px-5 py-3">
+                                <p className="text-xs text-slate-600 line-clamp-4">{evs[0].description}</p>
+                              </div>
+                            )}
+
+                            {/* Footer */}
+                            <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className={`w-1.5 h-1.5 rounded-full ${evs[0].status === 'ACTIVE' ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'}`} />
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{evs[0].status || 'ACTIVE'}</span>
+                                {isGroup && (
+                                  <span className="text-[9px] text-indigo-400 font-medium">{evs.length} linked records</span>
+                                )}
+                              </div>
+                              <div className="flex gap-1">
+                                {evs.map(ev => (
+                                  <button key={ev._id} onClick={() => handleDelete(ev._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-slate-300 hover:text-rose-500 transition-colors" title={`Delete ${ev.eventType}`}>
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* User health logs */}
+                {userRecs.length > 0 && (
+                  <div>
+                    <p className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">My Logs</p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                      {userRecs.map((rec, idx) => {
+                        const colors = ['bg-[#FFF9E5] border-[#FFECB3] text-amber-900', 'bg-[#EBF5FF] border-[#D1E9FF] text-blue-900', 'bg-[#FFF0F0] border-[#FFDADA] text-rose-900', 'bg-[#E6FFFA] border-[#B2F5EA] text-emerald-900', 'bg-[#EEF2FF] border-[#E0E7FF] text-indigo-900'];
+                        const colorClass = colors[idx % colors.length];
+                        return (
+                          <div key={rec._id} className={`p-6 rounded-3xl border-2 shadow-sm ${colorClass} hover:shadow-xl hover:-translate-y-1 transition-all relative group flex flex-col min-h-[200px]`}>
+                            <div className="flex justify-between items-start mb-3">
+                              <span className="text-[10px] font-bold uppercase tracking-widest bg-white/50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
+                              <span className="text-[10px] font-bold text-current/60">{new Date(rec.date).toLocaleDateString()}</span>
+                            </div>
+                            <div className="flex-1">
+                              <p className="text-sm font-semibold mb-1 line-clamp-1">{(rec.titles || []).join(', ')}</p>
+                              <p className="text-sm opacity-70 line-clamp-4 whitespace-pre-wrap">{rec.description}</p>
+                            </div>
+                            <div className="mt-4 pt-3 border-t border-current/10 flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <div className={`w-2 h-2 rounded-full ${rec.status === 'ACTIVE' ? 'bg-orange-500 animate-pulse' : 'bg-emerald-500'}`} />
+                                <span className="text-[10px] font-bold uppercase tracking-wider opacity-70">{rec.status || 'LOGGED'}</span>
+                              </div>
+                              <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); }} className="p-2 hover:bg-white/50 rounded-lg text-slate-600"><Edit3 className="w-4 h-4" /></button>
+                                <button onClick={() => handleDelete(rec._id)} className="p-2 hover:bg-rose-100 rounded-lg text-rose-600"><Trash2 className="w-4 h-4" /></button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {groupMap.size === 0 && userRecs.length === 0 && draftNote === null && (
+                  <div className="text-center py-20 text-slate-400">No health records yet.</div>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* Non-health-event boards (diet, lifestyle) — original grid */}
+          {endpoint !== 'health-events' && draftNote && (
             <div className="p-6 rounded-3xl border-2 border-dashed border-indigo-300 bg-indigo-50/30 shadow-xl animate-in zoom-in-95 duration-200 ring-2 ring-indigo-500/20 flex flex-col">
                <div className="flex justify-between items-center mb-4 gap-2">
                   <span className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">{typeLabel} Draft</span>
@@ -2208,51 +2567,38 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
             </div>
           )}
 
-          {records.map((rec, idx) => {
+          {endpoint !== 'health-events' && records.map((rec, idx) => {
             if (editingId === rec._id) return null;
             const colors = ['bg-[#FFF9E5] border-[#FFECB3] text-amber-900', 'bg-[#EBF5FF] border-[#D1E9FF] text-blue-900', 'bg-[#FFF0F0] border-[#FFDADA] text-rose-900', 'bg-[#E6FFFA] border-[#B2F5EA] text-emerald-900', 'bg-[#EEF2FF] border-[#E0E7FF] text-indigo-900'];
             const colorClass = colors[idx % colors.length];
             const tags = rec.titles || rec.mealTypes || rec.categories || [];
-            
             return (
               <div key={rec._id} className={`p-6 rounded-3xl border-2 shadow-sm ${colorClass} hover:shadow-xl hover:-translate-y-1 transition-all relative group flex flex-col min-h-[260px]`}>
-                 <div className="flex justify-between items-start mb-4">
-                    <span className="text-[10px] font-bold uppercase tracking-widest bg-white/50 px-2 py-1 rounded-lg">
-                      {rec.eventType || typeLabel}
-                    </span>
-                    <div className="text-[10px] font-bold text-current/60 text-right">
-                      <div>{new Date(rec.date).toLocaleDateString()}
-                        {endpoint === 'lifestyle' && rec.endDate && ` - ${new Date(rec.endDate).toLocaleDateString()}`}
-                      </div>
-                      {endpoint === 'diet-logs' && (
-                        <div className="opacity-50">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
-                      )}
+                <div className="flex justify-between items-start mb-4">
+                  <span className="text-[10px] font-bold uppercase tracking-widest bg-white/50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
+                  <div className="text-[10px] font-bold text-current/60 text-right">
+                    <div>{new Date(rec.date).toLocaleDateString()}{endpoint === 'lifestyle' && rec.endDate && ` - ${new Date(rec.endDate).toLocaleDateString()}`}</div>
+                    {endpoint === 'diet-logs' && <div className="opacity-50">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>}
+                  </div>
+                </div>
+                <div className="flex-1">
+                  <p className="text-sm opacity-80 line-clamp-6 whitespace-pre-wrap">{rec.description}</p>
+                </div>
+                <div className="mt-4 pt-4 border-t border-current/10">
+                  <div className="flex flex-wrap gap-1 mb-4">
+                    {tags.map(tag => <span key={tag} className="px-2 py-0.5 bg-white/40 text-[9px] font-bold rounded-md">{tag}</span>)}
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full ${rec.status === 'ACTIVE' ? 'bg-orange-500 animate-pulse' : 'bg-emerald-500'}`} />
+                      <span className="text-[10px] font-bold uppercase tracking-wider opacity-70">{rec.status || 'LOGGED'}</span>
                     </div>
-                 </div>
-                 <div className="flex-1">
-                   <p className="text-sm opacity-80 line-clamp-6 whitespace-pre-wrap">{rec.description}</p>
-                 </div>
-                 
-                 <div className="mt-4 pt-4 border-t border-current/10">
-                    <div className="flex flex-wrap gap-1 mb-4">
-                      {tags.map(tag => (
-                        <span key={tag} className="px-2 py-0.5 bg-white/40 text-[9px] font-bold rounded-md">
-                          {tag}
-                        </span>
-                      ))}
+                    <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); }} className="p-2 hover:bg-white/50 rounded-lg text-slate-600"><Edit3 className="w-4 h-4" /></button>
+                      <button onClick={() => handleDelete(rec._id)} className="p-2 hover:bg-rose-100 rounded-lg text-rose-600"><Trash2 className="w-4 h-4" /></button>
                     </div>
-
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <div className={`w-2 h-2 rounded-full ${rec.status === 'ACTIVE' ? 'bg-orange-500 animate-pulse' : 'bg-emerald-500'}`}></div>
-                        <span className="text-[10px] font-bold uppercase tracking-wider opacity-70">{rec.status || 'LOGGED'}</span>
-                      </div>
-                      <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                        <button onClick={() => {setEditingId(rec._id); setDraftNote({...rec, date: new Date(rec.date).toISOString()});}} className="p-2 hover:bg-white/50 rounded-lg text-slate-600"><Edit3 className="w-4 h-4" /></button>
-                        <button onClick={() => handleDelete(rec._id)} className="p-2 hover:bg-rose-100 rounded-lg text-rose-600"><Trash2 className="w-4 h-4" /></button>
-                      </div>
-                    </div>
-                 </div>
+                  </div>
+                </div>
               </div>
             );
           })}
@@ -2260,45 +2606,135 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
       ) : (
         /* Timeline View */
         <div className="relative max-w-4xl mx-auto pl-8 border-l-2 border-slate-200 space-y-12 pb-10">
-          {records.map((rec, idx) => {
-             const tags = rec.titles || rec.mealTypes || rec.categories || [];
-             return (
-            <div key={rec._id} className="relative group animate-in slide-in-from-left-4 duration-500">
-               <div className="absolute -left-[41px] top-0 w-5 h-5 rounded-full bg-white border-4 border-indigo-500 shadow-sm z-10"></div>
-               <div className="flex flex-col md:flex-row md:items-start gap-4 md:gap-8">
+          {endpoint === 'health-events' ? (() => {
+            const healthRecs = records as (RecordItem & { source?: string; reportGroupId?: string; details?: HealthEvent['details']; eventType?: string })[];
+            const groupMap = new Map<string, typeof healthRecs>();
+            for (const rec of healthRecs) {
+              const key = rec.reportGroupId || rec._id;
+              if (!groupMap.has(key)) groupMap.set(key, []);
+              groupMap.get(key)!.push(rec);
+            }
+            return Array.from(groupMap.entries()).map(([key, evs]) => {
+              const isGroup = !!evs[0].reportGroupId;
+              const visitEv = evs.find(e => e.eventType === 'DOCTOR_VISIT');
+              const rxEv    = evs.find(e => e.eventType === 'PRESCRIPTION');
+              const testEv  = evs.find(e => e.eventType === 'TEST_RESULTS');
+              const docInfo: DoctorInfo = visitEv?.details?.doctorInfo ?? rxEv?.details?.doctorInfo ?? {};
+              return (
+                <div key={key} className="relative group animate-in slide-in-from-left-4 duration-500">
+                  <div className={`absolute -left-[41px] top-0 w-5 h-5 rounded-full bg-white border-4 shadow-sm z-10 ${isGroup ? 'border-indigo-500' : 'border-slate-400'}`} />
+                  <div className="flex flex-col md:flex-row md:items-start gap-4 md:gap-8">
+                    <div className="min-w-[120px] pt-0.5">
+                      <p className="text-sm font-bold text-slate-900">{new Date(evs[0].date).toLocaleDateString()}</p>
+                      {isGroup && <p className="text-[10px] text-indigo-500 font-bold mt-0.5">Visit Group</p>}
+                    </div>
+                    <div className={`flex-1 rounded-3xl border overflow-hidden shadow-sm hover:shadow-md transition-all ${isGroup ? 'border-indigo-200' : 'border-slate-200 bg-white'}`}>
+                      {isGroup && (
+                        <div className="bg-indigo-600 px-5 py-3 text-white">
+                          <div className="flex items-center gap-2">
+                            <Link2 className="w-4 h-4 text-indigo-300" />
+                            <span className="text-xs font-black uppercase tracking-wider">
+                              {docInfo.name ? (docInfo.specialty ? `${docInfo.name} · ${docInfo.specialty}` : docInfo.name) : 'Visit Group'}
+                            </span>
+                          </div>
+                          {(docInfo.hospital || docInfo.address) && (
+                            <p className="text-[10px] text-indigo-200 mt-0.5 flex items-center gap-1">
+                              <MapPin className="w-3 h-3" />{[docInfo.hospital, docInfo.address].filter(Boolean).join(' — ')}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                      {visitEv && (
+                        <div className="bg-white px-5 py-3 border-b border-slate-100">
+                          <div className="flex items-center gap-2 mb-1">
+                            <Stethoscope className="w-4 h-4 text-rose-500" />
+                            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Diagnoses</span>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {(visitEv.details?.conditions ?? []).map((c, i) => (
+                              <span key={i} className="px-2 py-0.5 bg-rose-50 text-rose-700 text-[10px] font-bold rounded-full border border-rose-100">{c}</span>
+                            ))}
+                          </div>
+                          {(visitEv.details?.injections ?? []).length > 0 && (
+                            <p className="text-[10px] text-amber-600 mt-1 font-medium">Injections: {visitEv.details!.injections!.join(', ')}</p>
+                          )}
+                        </div>
+                      )}
+                      {rxEv && (rxEv.details?.medications ?? []).length > 0 && (
+                        <div className="bg-white px-5 py-3 border-b border-slate-100">
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <Pill className="w-4 h-4 text-indigo-500" />
+                            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Prescription</span>
+                          </div>
+                          <div className="space-y-1">
+                            {rxEv.details!.medications!.map((m, i) => (
+                              <div key={i} className="flex items-center justify-between text-xs">
+                                <span className="font-semibold text-slate-700">{m.name} <span className="text-slate-400 font-normal">{m.dosage} · {m.frequency}</span></span>
+                                <div className="flex gap-1">
+                                  {m.isDaily && <span className="text-[9px] font-bold px-1.5 py-0.5 bg-teal-50 text-teal-600 rounded-full">DAILY</span>}
+                                  <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${m.route === 'INJECTION' ? 'bg-amber-50 text-amber-600' : 'bg-slate-50 text-slate-500'}`}>{m.route || 'ORAL'}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {testEv && (testEv.details?.testResults ?? []).length > 0 && (
+                        <div className="bg-white px-5 py-3">
+                          <div className="flex items-center gap-2 mb-1.5">
+                            <FlaskConical className="w-4 h-4 text-emerald-500" />
+                            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Test Results</span>
+                          </div>
+                          <div className="space-y-1">
+                            {testEv.details!.testResults!.map((t, i) => (
+                              <div key={i} className="flex items-center justify-between text-xs">
+                                <span className="font-semibold text-slate-700">{t.testName}{t.value && <span className="text-slate-400 font-normal"> : {t.value}</span>}</span>
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${t.status === 'ABNORMAL' ? 'bg-rose-50 text-rose-600' : t.status === 'BORDERLINE' ? 'bg-amber-50 text-amber-600' : 'bg-emerald-50 text-emerald-600'}`}>{t.status}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {!visitEv && !rxEv && !testEv && (
+                        <div className="bg-white px-5 py-4">
+                          <p className="text-sm text-slate-600">{evs[0].description}</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            });
+          })() : records.map((rec) => {
+            const tags = rec.titles || rec.mealTypes || rec.categories || [];
+            return (
+              <div key={rec._id} className="relative group animate-in slide-in-from-left-4 duration-500">
+                <div className="absolute -left-[41px] top-0 w-5 h-5 rounded-full bg-white border-4 border-indigo-500 shadow-sm z-10" />
+                <div className="flex flex-col md:flex-row md:items-start gap-4 md:gap-8">
                   <div className="min-w-[120px] pt-0.5">
                     <p className="text-sm font-bold text-slate-900">
                       {new Date(rec.date).toLocaleDateString()}
-                      {endpoint === 'lifestyle' && rec.endDate && (
-                        <span className="block text-[10px] text-slate-400">to {new Date(rec.endDate).toLocaleDateString()}</span>
-                      )}
+                      {endpoint === 'lifestyle' && rec.endDate && <span className="block text-[10px] text-slate-400">to {new Date(rec.endDate).toLocaleDateString()}</span>}
                     </p>
-                    {endpoint === 'diet-logs' && (
-                      <p className="text-xs font-medium text-slate-400">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
-                    )}
+                    {endpoint === 'diet-logs' && <p className="text-xs font-medium text-slate-400">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>}
                   </div>
                   <div className="flex-1 bg-white p-6 rounded-3xl border border-slate-200 shadow-sm hover:shadow-md transition-all">
-                     <div className="flex justify-between items-start mb-2">
-                        <div className="flex flex-wrap gap-1">
-                          <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 bg-indigo-50 px-2 py-1 rounded-lg">
-                            {rec.eventType || typeLabel}
-                          </span>
-                          {tags.map(tag => (
-                            <span key={tag} className="text-[9px] font-bold uppercase text-slate-500 bg-slate-100 px-2 py-1 rounded-lg">
-                              {tag}
-                            </span>
-                          ))}
-                        </div>
-                        <div className="flex gap-1">
-                          <button onClick={() => {setEditingId(rec._id); setDraftNote({...rec, date: new Date(rec.date).toISOString()}); setViewMode('board');}} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400"><Edit3 className="w-3.5 h-3.5" /></button>
-                          <button onClick={() => handleDelete(rec._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-rose-400"><Trash2 className="w-3.5 h-3.5" /></button>
-                        </div>
-                     </div>
-                     <p className="text-sm text-slate-500 leading-relaxed whitespace-pre-wrap">{rec.description}</p>
+                    <div className="flex justify-between items-start mb-2">
+                      <div className="flex flex-wrap gap-1">
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 bg-indigo-50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
+                        {tags.map(tag => <span key={tag} className="text-[9px] font-bold uppercase text-slate-500 bg-slate-100 px-2 py-1 rounded-lg">{tag}</span>)}
+                      </div>
+                      <div className="flex gap-1">
+                        <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); setViewMode('board'); }} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400"><Edit3 className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => handleDelete(rec._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-rose-400"><Trash2 className="w-3.5 h-3.5" /></button>
+                      </div>
+                    </div>
+                    <p className="text-sm text-slate-500 leading-relaxed whitespace-pre-wrap">{rec.description}</p>
                   </div>
-               </div>
-            </div>
-          )})}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
