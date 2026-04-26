@@ -93,6 +93,13 @@ interface HealthEvent {
   };
 }
 
+interface MedLogItem {
+  name: string;
+  dosage?: string;
+  duration?: string;
+  instructions?: string;
+}
+
 interface DietLog {
   _id: string;
   date: string;
@@ -102,6 +109,9 @@ interface DietLog {
   source?: string;
   reportGroupId?: string;
   reportLabel?: string;
+  cardType?: string;   // PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | MEAL | DIETARY_ADVICE
+  timing?: string;     // BEFORE_BREAKFAST | AFTER_BREAKFAST | etc.
+  medicationItems?: MedLogItem[];
 }
 
 interface LifestyleRecord {
@@ -2139,6 +2149,9 @@ interface RecordItem {
   status?: string;
   reportLabel?: string;
   source?: string;
+  cardType?: string;
+  timing?: string;
+  medicationItems?: MedLogItem[];
 }
 
 type EditableHealthGroup = {
@@ -2668,39 +2681,108 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
 
           {endpoint !== 'health-events' && records.map((rec, idx) => {
             if (editingId === rec._id) return null;
-            const colors = ['bg-[#FFF9E5] border-[#FFECB3] text-amber-900', 'bg-[#EBF5FF] border-[#D1E9FF] text-blue-900', 'bg-[#FFF0F0] border-[#FFDADA] text-rose-900', 'bg-[#E6FFFA] border-[#B2F5EA] text-emerald-900', 'bg-[#EEF2FF] border-[#E0E7FF] text-indigo-900'];
-            const colorClass = colors[idx % colors.length];
-            const tags = rec.titles || rec.mealTypes || rec.categories || [];
+
+            // ── Diet card type resolution ────────────────────────────────────
+            const isMedCard = rec.cardType === 'PRE_MEAL_MEDICATION' || rec.cardType === 'POST_MEAL_MEDICATION';
+            const isFoodCard = rec.cardType === 'MEAL';
+            const isAdviceCard = rec.cardType === 'DIETARY_ADVICE';
+            const hasMedItems = (rec.medicationItems?.length ?? 0) > 0;
+
+            type CardProfile = { label: string; border: string; bg: string; header: string; headerText: string; timingBg: string; timingText: string; tagBg: string };
+            const cardProfile: CardProfile = (() => {
+              if (rec.cardType === 'PRE_MEAL_MEDICATION')  return { label: 'Pre-Meal Medication',  border: 'border-amber-200',  bg: 'bg-amber-50',   header: 'bg-amber-500',   headerText: 'text-white',      timingBg: 'bg-amber-100',  timingText: 'text-amber-800', tagBg: 'bg-amber-100/60' };
+              if (rec.cardType === 'POST_MEAL_MEDICATION') return { label: 'Post-Meal Medication', border: 'border-blue-200',   bg: 'bg-blue-50',    header: 'bg-blue-500',    headerText: 'text-white',      timingBg: 'bg-blue-100',   timingText: 'text-blue-800',  tagBg: 'bg-blue-100/60'  };
+              if (rec.cardType === 'MEAL')                 return { label: 'Meal',                 border: 'border-emerald-200',bg: 'bg-emerald-50', header: 'bg-emerald-500', headerText: 'text-white',      timingBg: 'bg-emerald-100',timingText: 'text-emerald-800',tagBg:'bg-emerald-100/60'};
+              if (rec.cardType === 'DIETARY_ADVICE')       return { label: 'Dietary Advice',       border: 'border-teal-200',   bg: 'bg-teal-50',    header: 'bg-teal-500',    headerText: 'text-white',      timingBg: 'bg-teal-100',   timingText: 'text-teal-800',  tagBg: 'bg-teal-100/60'  };
+              // fallback: lifestyle or generic
+              const palettes: CardProfile[] = [
+                { label: typeLabel, border: 'border-[#FFECB3]', bg: 'bg-[#FFF9E5]', header: 'bg-amber-400',   headerText: 'text-amber-900',  timingBg: 'bg-amber-100',  timingText: 'text-amber-900',  tagBg: 'bg-white/40' },
+                { label: typeLabel, border: 'border-[#D1E9FF]', bg: 'bg-[#EBF5FF]', header: 'bg-blue-400',    headerText: 'text-blue-900',   timingBg: 'bg-blue-100',   timingText: 'text-blue-900',   tagBg: 'bg-white/40' },
+                { label: typeLabel, border: 'border-[#FFDADA]', bg: 'bg-[#FFF0F0]', header: 'bg-rose-400',    headerText: 'text-rose-900',   timingBg: 'bg-rose-100',   timingText: 'text-rose-900',   tagBg: 'bg-white/40' },
+                { label: typeLabel, border: 'border-[#B2F5EA]', bg: 'bg-[#E6FFFA]', header: 'bg-teal-400',    headerText: 'text-teal-900',   timingBg: 'bg-teal-100',   timingText: 'text-teal-900',   tagBg: 'bg-white/40' },
+                { label: typeLabel, border: 'border-[#E0E7FF]', bg: 'bg-[#EEF2FF]', header: 'bg-indigo-400',  headerText: 'text-indigo-900', timingBg: 'bg-indigo-100', timingText: 'text-indigo-900', tagBg: 'bg-white/40' },
+              ];
+              return palettes[idx % palettes.length];
+            })();
+
+            const timingLabel = rec.timing ? rec.timing.replace(/_/g, ' ') : '';
+            // Extract period from description first line if present (e.g. "BEFORE BREAKFAST · 30 days:")
+            const periodMatch = rec.description?.match(/·\s*([^:]+):/);
+            const period = periodMatch ? periodMatch[1].trim() : '';
+
+            const tags = (rec.mealTypes || rec.categories || []).filter(t => t !== rec.cardType);
+
             return (
-              <div key={rec._id} className={`p-6 rounded-3xl border-2 shadow-sm ${colorClass} hover:shadow-xl hover:-translate-y-1 transition-all relative group flex flex-col min-h-[260px]`}>
-                <div className="flex justify-between items-start mb-4">
-                  <span className="text-[10px] font-bold uppercase tracking-widest bg-white/50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
-                  <div className="text-[10px] font-bold text-current/60 text-right">
-                    <div>{new Date(rec.date).toLocaleDateString()}{endpoint === 'lifestyle' && rec.endDate && ` - ${new Date(rec.endDate).toLocaleDateString()}`}</div>
-                    {endpoint === 'diet-logs' && <div className="opacity-50">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>}
+              <div key={rec._id} className={`rounded-3xl border-2 shadow-sm ${cardProfile.border} ${cardProfile.bg} hover:shadow-xl hover:-translate-y-1 transition-all relative group flex flex-col overflow-hidden`}>
+
+                {/* Card header band */}
+                <div className={`${cardProfile.header} px-5 py-3 flex items-center justify-between`}>
+                  <span className={`text-[10px] font-black uppercase tracking-widest ${cardProfile.headerText}`}>{cardProfile.label}</span>
+                  <div className={`text-[10px] font-bold text-right ${cardProfile.headerText} opacity-80`}>
+                    <div>{new Date(rec.date).toLocaleDateString()}</div>
+                    {endpoint === 'diet-logs' && <div className="opacity-70">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>}
+                    {endpoint === 'lifestyle' && rec.endDate && <div className="opacity-70">→ {new Date(rec.endDate).toLocaleDateString()}</div>}
                   </div>
                 </div>
-                {rec.reportLabel && (
-                  <div className="flex items-center gap-1 mb-2">
-                    <Link2 className="w-3 h-3 text-indigo-500 flex-shrink-0" />
-                    <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50/80 border border-indigo-100 px-2 py-0.5 rounded-full truncate max-w-[180px]">{rec.reportLabel}</span>
-                  </div>
-                )}
-                <div className="flex-1">
-                  <p className="text-sm opacity-80 line-clamp-6 whitespace-pre-wrap">{rec.description}</p>
-                </div>
-                <div className="mt-4 pt-4 border-t border-current/10">
-                  <div className="flex flex-wrap gap-1 mb-4">
-                    {tags.map(tag => <span key={tag} className="px-2 py-0.5 bg-white/40 text-[9px] font-bold rounded-md">{tag}</span>)}
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className={`w-2 h-2 rounded-full ${rec.status === 'ACTIVE' ? 'bg-orange-500 animate-pulse' : 'bg-emerald-500'}`} />
-                      <span className="text-[10px] font-bold uppercase tracking-wider opacity-70">{rec.status || 'LOGGED'}</span>
+
+                <div className="px-5 pt-3 pb-4 flex flex-col flex-1">
+                  {/* Report link */}
+                  {rec.reportLabel && (
+                    <div className="flex items-center gap-1 mb-3">
+                      <Link2 className="w-3 h-3 text-indigo-500 flex-shrink-0" />
+                      <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded-full truncate max-w-[200px]">{rec.reportLabel}</span>
                     </div>
-                    <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); }} className="p-2 hover:bg-white/50 rounded-lg text-slate-600"><Edit3 className="w-4 h-4" /></button>
-                      <button onClick={() => handleDelete(rec._id)} className="p-2 hover:bg-rose-100 rounded-lg text-rose-600"><Trash2 className="w-4 h-4" /></button>
+                  )}
+
+                  {/* Timing + period badge (for doctor diet cards) */}
+                  {timingLabel && (
+                    <div className={`inline-flex items-center gap-1.5 self-start px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider mb-3 ${cardProfile.timingBg} ${cardProfile.timingText}`}>
+                      <Clock className="w-3 h-3" />
+                      {timingLabel}{period && <span className="font-normal normal-case ml-0.5">· {period}</span>}
+                    </div>
+                  )}
+
+                  {/* Medication items (structured rows) */}
+                  {hasMedItems ? (
+                    <div className="space-y-2 flex-1">
+                      {rec.medicationItems!.map((med, i) => (
+                        <div key={i} className="bg-white/70 rounded-xl px-3 py-2 border border-white/80 shadow-sm">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs font-bold text-slate-800 leading-snug">{med.name}</p>
+                              {med.dosage && <p className="text-[10px] text-slate-500 mt-0.5">{med.dosage}</p>}
+                              {med.instructions && <p className="text-[10px] text-slate-400 italic mt-0.5">{med.instructions}</p>}
+                            </div>
+                            {med.duration && (
+                              <span className={`text-[9px] font-black px-2 py-0.5 rounded-full flex-shrink-0 ${cardProfile.timingBg} ${cardProfile.timingText} border border-current/10`}>{med.duration}</span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    /* Plain food / lifestyle description */
+                    <div className="flex-1">
+                      <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap line-clamp-6">{rec.description}</p>
+                    </div>
+                  )}
+
+                  {/* Footer: tags + status + actions */}
+                  <div className="mt-4 pt-3 border-t border-slate-200/60">
+                    <div className="flex flex-wrap gap-1 mb-2">
+                      {tags.map(tag => (
+                        <span key={tag} className={`px-2 py-0.5 text-[9px] font-bold rounded-md ${cardProfile.tagBg} text-slate-600 border border-slate-200/50`}>{tag}</span>
+                      ))}
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <div className={`w-2 h-2 rounded-full ${rec.status === 'ACTIVE' ? 'bg-orange-500 animate-pulse' : 'bg-emerald-500'}`} />
+                        <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">{rec.status || 'LOGGED'}</span>
+                      </div>
+                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); }} className="p-1.5 hover:bg-white/60 rounded-lg text-slate-500"><Edit3 className="w-4 h-4" /></button>
+                        <button onClick={() => handleDelete(rec._id)} className="p-1.5 hover:bg-rose-100 rounded-lg text-rose-500"><Trash2 className="w-4 h-4" /></button>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -2811,10 +2893,29 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
               );
             });
           })() : records.map((rec) => {
-            const tags = rec.titles || rec.mealTypes || rec.categories || [];
+            const isMedCard  = rec.cardType === 'PRE_MEAL_MEDICATION' || rec.cardType === 'POST_MEAL_MEDICATION';
+            const hasMedItems = (rec.medicationItems?.length ?? 0) > 0;
+            const timingLabel = rec.timing ? rec.timing.replace(/_/g, ' ') : '';
+            const periodMatch = rec.description?.match(/·\s*([^:]+):/);
+            const period = periodMatch ? periodMatch[1].trim() : '';
+
+            const dotColor = rec.cardType === 'PRE_MEAL_MEDICATION' ? 'border-amber-500'
+                           : rec.cardType === 'POST_MEAL_MEDICATION' ? 'border-blue-500'
+                           : rec.cardType === 'MEAL'                 ? 'border-emerald-500'
+                           : rec.cardType === 'DIETARY_ADVICE'       ? 'border-teal-500'
+                           : 'border-indigo-500';
+
+            const cardLabel = rec.cardType === 'PRE_MEAL_MEDICATION'  ? 'Pre-Meal Medication'
+                            : rec.cardType === 'POST_MEAL_MEDICATION' ? 'Post-Meal Medication'
+                            : rec.cardType === 'MEAL'                 ? 'Meal'
+                            : rec.cardType === 'DIETARY_ADVICE'       ? 'Dietary Advice'
+                            : typeLabel;
+
+            const tags = (rec.mealTypes || rec.categories || []).filter(t => t !== rec.cardType);
+
             return (
               <div key={rec._id} className="relative group animate-in slide-in-from-left-4 duration-500">
-                <div className="absolute -left-[41px] top-0 w-5 h-5 rounded-full bg-white border-4 border-indigo-500 shadow-sm z-10" />
+                <div className={`absolute -left-[41px] top-0 w-5 h-5 rounded-full bg-white border-4 shadow-sm z-10 ${dotColor}`} />
                 <div className="flex flex-col md:flex-row md:items-start gap-4 md:gap-8">
                   <div className="min-w-[120px] pt-0.5">
                     <p className="text-sm font-bold text-slate-900">
@@ -2822,24 +2923,56 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
                       {endpoint === 'lifestyle' && rec.endDate && <span className="block text-[10px] text-slate-400">to {new Date(rec.endDate).toLocaleDateString()}</span>}
                     </p>
                     {endpoint === 'diet-logs' && <p className="text-xs font-medium text-slate-400">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>}
+                    {cardLabel !== typeLabel && <p className={`text-[10px] font-black mt-0.5 ${isMedCard ? 'text-amber-600' : 'text-emerald-600'}`}>{cardLabel}</p>}
                   </div>
-                  <div className="flex-1 bg-white p-6 rounded-3xl border border-slate-200 shadow-sm hover:shadow-md transition-all">
-                    <div className="flex justify-between items-start mb-2">
-                      <div className="flex flex-wrap gap-1">
-                        <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 bg-indigo-50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
-                        {tags.map(tag => <span key={tag} className="text-[9px] font-bold uppercase text-slate-500 bg-slate-100 px-2 py-1 rounded-lg">{tag}</span>)}
-                        {rec.reportLabel && (
-                          <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded-full">
-                            <Link2 className="w-3 h-3" />{rec.reportLabel}
-                          </span>
-                        )}
+                  <div className="flex-1 bg-white rounded-3xl border border-slate-200 shadow-sm hover:shadow-md transition-all overflow-hidden">
+                    {/* Slim coloured top bar for doctor cards */}
+                    {rec.cardType && (
+                      <div className={`h-1.5 w-full ${rec.cardType === 'PRE_MEAL_MEDICATION' ? 'bg-amber-400' : rec.cardType === 'POST_MEAL_MEDICATION' ? 'bg-blue-400' : rec.cardType === 'MEAL' ? 'bg-emerald-400' : 'bg-teal-400'}`} />
+                    )}
+                    <div className="p-5">
+                      <div className="flex justify-between items-start mb-3">
+                        <div className="flex flex-wrap gap-1">
+                          {rec.reportLabel && (
+                            <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded-full">
+                              <Link2 className="w-3 h-3" />{rec.reportLabel}
+                            </span>
+                          )}
+                          {timingLabel && (
+                            <span className={`flex items-center gap-1 text-[9px] font-black uppercase px-2 py-0.5 rounded-full ${isMedCard ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600'}`}>
+                              <Clock className="w-3 h-3" />{timingLabel}{period && ` · ${period}`}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex gap-1">
+                          <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); setViewMode('board'); }} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400"><Edit3 className="w-3.5 h-3.5" /></button>
+                          <button onClick={() => handleDelete(rec._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-rose-400"><Trash2 className="w-3.5 h-3.5" /></button>
+                        </div>
                       </div>
-                      <div className="flex gap-1">
-                        <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); setViewMode('board'); }} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400"><Edit3 className="w-3.5 h-3.5" /></button>
-                        <button onClick={() => handleDelete(rec._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-rose-400"><Trash2 className="w-3.5 h-3.5" /></button>
-                      </div>
+
+                      {hasMedItems ? (
+                        <div className="space-y-2">
+                          {rec.medicationItems!.map((med, i) => (
+                            <div key={i} className="flex items-start justify-between gap-2 py-1.5 border-b border-slate-50 last:border-0">
+                              <div className="min-w-0">
+                                <span className="text-xs font-bold text-slate-800">{med.name}</span>
+                                {med.dosage && <span className="text-[10px] text-slate-500 ml-1.5">{med.dosage}</span>}
+                                {med.instructions && <p className="text-[10px] text-slate-400 italic mt-0.5">{med.instructions}</p>}
+                              </div>
+                              {med.duration && <span className="text-[9px] font-black bg-amber-50 text-amber-700 border border-amber-100 px-2 py-0.5 rounded-full flex-shrink-0">{med.duration}</span>}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-slate-500 leading-relaxed whitespace-pre-wrap">{rec.description}</p>
+                      )}
+
+                      {tags.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-3">
+                          {tags.map(tag => <span key={tag} className="text-[9px] font-bold uppercase text-slate-500 bg-slate-100 px-2 py-0.5 rounded-lg">{tag}</span>)}
+                        </div>
+                      )}
                     </div>
-                    <p className="text-sm text-slate-500 leading-relaxed whitespace-pre-wrap">{rec.description}</p>
                   </div>
                 </div>
               </div>

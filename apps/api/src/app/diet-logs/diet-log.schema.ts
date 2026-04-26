@@ -34,6 +34,21 @@ export class DietLog {
 
   @Prop()
   reportLabel?: string; // e.g. "Dr. John · Apr 26 2026"
+
+  // Card display metadata (set by LangGraph; absent on user-created records)
+  @Prop()
+  cardType?: string; // MEAL | PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | DIETARY_ADVICE
+
+  @Prop()
+  timing?: string; // BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
+
+  @Prop([Object])
+  medicationItems?: {
+    name: string;
+    dosage?: string;
+    duration?: string;
+    instructions?: string;
+  }[];
 }
 
 export const DietLogSchema = SchemaFactory.createForClass(DietLog);

@@ -72,12 +72,21 @@ interface TestItem {
   status: string;       // NORMAL | ABNORMAL | BORDERLINE
 }
 
-// ONE diet card per meal-timing slot — bundles all instructions for that timing
+interface MedItem {
+  name: string;
+  dosage?: string;
+  duration?: string;
+  instructions?: string;
+}
+
+// ONE diet card per meal-timing slot
 interface DietSlot {
-  timing: string;      // BEFORE_BREAKFAST | WITH_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | WITH_LUNCH | AFTER_LUNCH | BEFORE_DINNER | WITH_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
-  mealTypes: string[]; // BREAKFAST | LUNCH | DINNER | SNACK | PILLS — used as DB tags
-  items: string[];     // each individual instruction/medication for this timing slot
-  period?: string;     // how long to follow (e.g. "30 days", "2 weeks", "ongoing")
+  timing: string;           // BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
+  cardType: string;         // PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | MEAL | DIETARY_ADVICE
+  mealTypes: string[];      // BREAKFAST | LUNCH | DINNER | SNACK | PILLS — DB display tags
+  medicationItems?: MedItem[]; // structured per-med rows for medication cards
+  foodItems?: string[];     // food/dietary advice items (plain text)
+  period?: string;          // overall duration when no per-item duration set
 }
 
 interface ParsedHealthData {
@@ -364,15 +373,21 @@ export class AgentService {
       '  },',
       '',
       '  "dietAdvice": [',
-      '    IMPORTANT: Group ALL diet-related instructions by MEAL TIMING into slots.',
-      '    Each slot = ONE card. Do NOT create one item per medication — bundle all medications/advice for the same timing into one slot.',
-      '    Timing options: BEFORE_BREAKFAST | WITH_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | WITH_LUNCH | AFTER_LUNCH | BEFORE_DINNER | WITH_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL',
-      '    mealTypes tag options: BREAKFAST | LUNCH | DINNER | SNACK | PILLS (use PILLS when slot contains medications)',
+      '    CRITICAL: Group ALL diet-related content (food advice AND medications) by meal timing into slots. ONE slot per timing.',
+      '    cardType options: PRE_MEAL_MEDICATION (meds before a meal) | POST_MEAL_MEDICATION (meds after a meal) | MEAL (food advice for a meal) | DIETARY_ADVICE (general restrictions)',
+      '    timing options: BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL',
+      '    mealTypes options: BREAKFAST | LUNCH | DINNER | SNACK | PILLS (always include PILLS when slot has medications)',
+      '    For MEDICATION slots use medicationItems[] with per-med name/dosage/duration/instructions.',
+      '    For MEAL or DIETARY_ADVICE slots use foodItems[] (plain text array).',
       '    {',
-      '      "timing": "<timing key from above>",',
-      '      "mealTypes": ["<BREAKFAST|LUNCH|DINNER|SNACK|PILLS>"],',
-      '      "items": ["<drug name + dose + instruction>", "<another instruction for same timing>"],',
-      '      "period": "<duration e.g. 30 days | 2 weeks | ongoing>"',
+      '      "timing": "<timing key>",',
+      '      "cardType": "<PRE_MEAL_MEDICATION|POST_MEAL_MEDICATION|MEAL|DIETARY_ADVICE>",',
+      '      "mealTypes": ["<PILLS|BREAKFAST|LUNCH|DINNER|SNACK>"],',
+      '      "medicationItems": [',
+      '        { "name": "<drug name>", "dosage": "<dose>", "duration": "<e.g. 30 days>", "instructions": "<e.g. 30 mins before food>" }',
+      '      ],',
+      '      "foodItems": ["<food advice text>"],',
+      '      "period": "<overall duration if same for all items>"',
       '    }',
       '  ],',
       '',
@@ -513,25 +528,45 @@ export class AgentService {
 
     // ── Diet advice — ONE card per timing slot ────────────────────────────────
     for (const slot of parsedData.dietAdvice ?? []) {
-      if (!slot.items?.length) continue;
+      const hasMeds  = (slot.medicationItems?.length ?? 0) > 0;
+      const hasFood  = (slot.foodItems?.length ?? 0) > 0;
+      if (!hasMeds && !hasFood) continue;
       try {
-        const timingLabel = slot.timing?.replace(/_/g, ' ') ?? 'General';
-        const periodSuffix = slot.period ? ` (${slot.period})` : '';
-        const description = `${timingLabel}${periodSuffix}:\n${slot.items.map(i => `• ${i}`).join('\n')}`;
+        const timingLabel = (slot.timing ?? 'GENERAL').replace(/_/g, ' ');
+        const periodSuffix = slot.period ? ` · ${slot.period}` : '';
+
+        // Build a plain-text description for embed / compact panel display
+        let description: string;
+        if (hasMeds) {
+          description = `${timingLabel}${periodSuffix}:\n` +
+            slot.medicationItems!.map(m => {
+              const parts = [m.name];
+              if (m.dosage) parts.push(m.dosage);
+              if (m.duration) parts.push(m.duration);
+              if (m.instructions) parts.push(`(${m.instructions})`);
+              return `• ${parts.join(' — ')}`;
+            }).join('\n');
+        } else {
+          description = `${timingLabel}${periodSuffix}:\n${slot.foodItems!.map(f => `• ${f}`).join('\n')}`;
+        }
+
         const doc = await new this.dietLogModel({
           userId,
           description,
-          mealTypes: slot.mealTypes?.length ? slot.mealTypes : ['GENERAL'],
+          mealTypes:       slot.mealTypes?.length ? slot.mealTypes : ['GENERAL'],
+          cardType:        slot.cardType  ?? (hasMeds ? 'PRE_MEAL_MEDICATION' : 'DIETARY_ADVICE'),
+          timing:          slot.timing    ?? 'GENERAL',
+          medicationItems: hasMeds ? slot.medicationItems : undefined,
           source: 'DOCTOR',
           date: today,
           reportGroupId,
           reportLabel,
         }).save();
-        await this.embedAndStore(
-          userId, doc._id.toString(), 'DIET_LOG',
-          `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.items.join('; ')}`,
-          doc.date.toISOString()
-        );
+
+        const embedText = hasMeds
+          ? `Doctor ${slot.cardType ?? 'medication'} on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.medicationItems!.map(m => m.name).join(', ')}`
+          : `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.foodItems!.join('; ')}`;
+        await this.embedAndStore(userId, doc._id.toString(), 'DIET_LOG', embedText, doc.date.toISOString());
         dietSlotsSaved++;
       } catch (err: any) {
         this.logger.error('storeDietLog error:', err.message);
