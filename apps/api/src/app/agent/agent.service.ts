@@ -72,6 +72,14 @@ interface TestItem {
   status: string;       // NORMAL | ABNORMAL | BORDERLINE
 }
 
+// ONE diet card per meal-timing slot — bundles all instructions for that timing
+interface DietSlot {
+  timing: string;      // BEFORE_BREAKFAST | WITH_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | WITH_LUNCH | AFTER_LUNCH | BEFORE_DINNER | WITH_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
+  mealTypes: string[]; // BREAKFAST | LUNCH | DINNER | SNACK | PILLS — used as DB tags
+  items: string[];     // each individual instruction/medication for this timing slot
+  period?: string;     // how long to follow (e.g. "30 days", "2 weeks", "ongoing")
+}
+
 interface ParsedHealthData {
   visitDate?: string;
   doctorInfo?: DoctorInfo;
@@ -94,7 +102,9 @@ interface ParsedHealthData {
     items: TestItem[];
     status: string;
   };
-  dietAdvice?: { description: string; mealTypes: string[] }[];
+  // ONE DietLog per timing slot (grouped by meal period)
+  dietAdvice?: DietSlot[];
+  // ONE Lifestyle record total — all items merged
   lifestyleAdvice?: { description: string; categories: string[] }[];
   newConditions?: string[];
   newMedications?: string[];
@@ -338,7 +348,7 @@ export class AgentService {
       '  },',
       '  "prescriptions": {',
       '    "items": [',
-      '      { "name": "<drug name>", "dosage": "<dose>", "frequency": "<frequency>", "duration": "<duration>",',
+      '      { "name": "<drug name>", "dosage": "<dose>", "frequency": "<e.g. 1-0-0-1>", "duration": "<e.g. 30 days>",',
       '        "route": "<ORAL|INJECTION|TOPICAL|IV|OTHER>",',
       '        "isDaily": <true if patient takes at home daily>,',
       '        "instructions": "<e.g. before meals, with water>" }',
@@ -352,14 +362,38 @@ export class AgentService {
       '    ],',
       '    "status": "ACTIVE"',
       '  },',
-      '  "dietAdvice": [{ "description": "<dietary instruction>", "mealTypes": ["BREAKFAST","LUNCH","DINNER"] }],',
-      '  "lifestyleAdvice": [{ "description": "<lifestyle instruction>", "categories": ["EXERCISE","SLEEP","DIET"] }],',
+      '',
+      '  "dietAdvice": [',
+      '    IMPORTANT: Group ALL diet-related instructions by MEAL TIMING into slots.',
+      '    Each slot = ONE card. Do NOT create one item per medication — bundle all medications/advice for the same timing into one slot.',
+      '    Timing options: BEFORE_BREAKFAST | WITH_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | WITH_LUNCH | AFTER_LUNCH | BEFORE_DINNER | WITH_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL',
+      '    mealTypes tag options: BREAKFAST | LUNCH | DINNER | SNACK | PILLS (use PILLS when slot contains medications)',
+      '    {',
+      '      "timing": "<timing key from above>",',
+      '      "mealTypes": ["<BREAKFAST|LUNCH|DINNER|SNACK|PILLS>"],',
+      '      "items": ["<drug name + dose + instruction>", "<another instruction for same timing>"],',
+      '      "period": "<duration e.g. 30 days | 2 weeks | ongoing>"',
+      '    }',
+      '  ],',
+      '',
+      '  "lifestyleAdvice": [',
+      '    { "description": "<ONE lifestyle instruction>", "categories": ["<EXERCISE|SLEEP|STRESS|GENERAL|DIET>"] }',
+      '  ],',
       '  "newConditions": ["<each diagnosis as plain string>"],',
       '  "newMedications": ["<medication name + dose as plain string>"]',
       '}',
       '',
-      'RULES:',
-      '- Include EVERY condition, medication, and test from the report',
+      'DIET GROUPING RULES (critical):',
+      '- Group medications AND food advice by when they are taken relative to meals.',
+      '  Example: All drugs taken 30 mins BEFORE breakfast → one BEFORE_BREAKFAST slot.',
+      '  Example: All drugs taken AFTER lunch → one AFTER_LUNCH slot.',
+      '  Example: General dietary restrictions (avoid coffee, eat small meals) → one GENERAL slot.',
+      '- A single slot may contain multiple medications AND food instructions if they share the same timing.',
+      '- Do NOT create a separate slot per medication — bundle everything for the same meal timing.',
+      '- If a drug has timing "1-0-0-1" (morning + night), split into BEFORE_BREAKFAST and BEFORE_DINNER slots.',
+      '- Include the drug name, dosage, and timing instruction in each items[] entry.',
+      '',
+      'OTHER RULES:',
       '- isDaily=true for tablets, capsules, tonics, syrups (taken at home); isDaily=false for hospital injections/IV',
       '- Injections given AT the clinic/hospital go in visitSummary.injections only, NOT in prescriptions',
       '- Omit "visitSummary", "prescriptions", or "testResults" keys entirely if not present in the report',
@@ -392,7 +426,7 @@ export class AgentService {
       .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
     const reportLabel = doctorName ? `${doctorName} · ${dateStr}` : dateStr;
     let savedCards = 0;
-    const dailyMedNames: string[] = [];
+    let dietSlotsSaved = 0;
 
     // ── ONE DOCTOR_VISIT card — all diagnoses bundled ─────────────────────────
     if (parsedData.visitSummary) {
@@ -451,22 +485,6 @@ export class AgentService {
       } catch (err: any) {
         this.logger.error('store PRESCRIPTION error:', err.message);
       }
-
-      // Daily oral meds → DietLog PILLS entry
-      for (const med of meds.filter(m => m.isDaily)) {
-        try {
-          const desc =
-            `${med.name} ${med.dosage} — ${med.frequency}` +
-            (med.instructions ? ` (${med.instructions})` : '');
-          await new this.dietLogModel({
-            userId, description: desc, mealTypes: ['PILLS'], source: 'DOCTOR', date: today,
-            reportGroupId, reportLabel,
-          }).save();
-          dailyMedNames.push(med.name);
-        } catch (err: any) {
-          this.logger.error('store daily-med diet entry error:', err.message);
-        }
-      }
     }
 
     // ── ONE TEST_RESULTS card — all tests bundled ─────────────────────────────
@@ -493,33 +511,51 @@ export class AgentService {
       }
     }
 
-    // ── Diet advice ───────────────────────────────────────────────────────────
-    for (const diet of parsedData.dietAdvice ?? []) {
+    // ── Diet advice — ONE card per timing slot ────────────────────────────────
+    for (const slot of parsedData.dietAdvice ?? []) {
+      if (!slot.items?.length) continue;
       try {
+        const timingLabel = slot.timing?.replace(/_/g, ' ') ?? 'General';
+        const periodSuffix = slot.period ? ` (${slot.period})` : '';
+        const description = `${timingLabel}${periodSuffix}:\n${slot.items.map(i => `• ${i}`).join('\n')}`;
         const doc = await new this.dietLogModel({
-          userId, description: diet.description, mealTypes: diet.mealTypes || [],
-          source: 'DOCTOR', date: today, reportGroupId, reportLabel,
+          userId,
+          description,
+          mealTypes: slot.mealTypes?.length ? slot.mealTypes : ['GENERAL'],
+          source: 'DOCTOR',
+          date: today,
+          reportGroupId,
+          reportLabel,
         }).save();
         await this.embedAndStore(
           userId, doc._id.toString(), 'DIET_LOG',
-          `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${diet.description}`,
+          `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.items.join('; ')}`,
           doc.date.toISOString()
         );
+        dietSlotsSaved++;
       } catch (err: any) {
         this.logger.error('storeDietLog error:', err.message);
       }
     }
 
-    // ── Lifestyle advice ──────────────────────────────────────────────────────
-    for (const ls of parsedData.lifestyleAdvice ?? []) {
+    // ── Lifestyle advice — ONE bundled record for the whole report ─────────────
+    const allLifestyle = parsedData.lifestyleAdvice ?? [];
+    if (allLifestyle.length > 0) {
       try {
+        const allCategories = Array.from(new Set(allLifestyle.flatMap(ls => ls.categories || [])));
+        const combinedDesc = allLifestyle.map(ls => `• ${ls.description}`).join('\n');
         const doc = await new this.lifestyleModel({
-          userId, description: ls.description, categories: ls.categories || [],
-          source: 'DOCTOR', date: today, reportGroupId, reportLabel,
+          userId,
+          description: combinedDesc,
+          categories: allCategories.length ? allCategories : ['GENERAL'],
+          source: 'DOCTOR',
+          date: today,
+          reportGroupId,
+          reportLabel,
         }).save();
         await this.embedAndStore(
           userId, doc._id.toString(), 'LIFESTYLE',
-          `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${ls.description}`,
+          `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${combinedDesc.slice(0, 200)}`,
           doc.date.toISOString()
         );
       } catch (err: any) {
@@ -544,9 +580,12 @@ export class AgentService {
       }
     }
 
-    if (savedCards === 0) return '';
-    const parts: string[] = [`${savedCards} health record card${savedCards > 1 ? 's' : ''} saved`];
-    if (dailyMedNames.length)  parts.push(`${dailyMedNames.length} daily med${dailyMedNames.length > 1 ? 's' : ''} added to diet`);
+    const lifestyleSaved = (parsedData.lifestyleAdvice ?? []).length > 0;
+    if (savedCards === 0 && dietSlotsSaved === 0 && !lifestyleSaved) return '';
+    const parts: string[] = [];
+    if (savedCards > 0)    parts.push(`${savedCards} health record card${savedCards > 1 ? 's' : ''} saved`);
+    if (dietSlotsSaved > 0) parts.push(`${dietSlotsSaved} diet schedule card${dietSlotsSaved > 1 ? 's' : ''} added`);
+    if (lifestyleSaved) parts.push('lifestyle advice saved');
     if (newConditions.length)  parts.push(`${newConditions.length} condition${newConditions.length > 1 ? 's' : ''} added to profile`);
     if (newMedications.length) parts.push(`${newMedications.length} medication${newMedications.length > 1 ? 's' : ''} added to profile`);
     return parts.join(', ') + '.';
