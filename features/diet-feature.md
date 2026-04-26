@@ -1,12 +1,12 @@
 # Diet Feature
 
-> Covers diet log types, LangGraph diet pipeline, card layout, medication detail expansion (side effects, dates, avoid list), and the Reminders widget.
+> Covers diet log types, LangGraph diet pipeline, card layout, the Record Detail Panel (view → edit → re-analysis), medication detail, and the Reminders widget.
 
 ---
 
 ## Overview
 
-The **Diet** feature logs a user's meals, medications, and dietary advice. Records arrive from manual entry or from the LangGraph pipeline after parsing a doctor's report. Diet logs rendered in the **Daily Diet** widget and the **Diet Logs** section of the Records Board use a card-based layout with at most 3 cards per medical report.
+The **Diet** feature logs a user's meals, medications, and dietary advice. Records arrive from manual entry or the LangGraph pipeline after parsing a doctor's report. Diet logs appear in the **Daily Diet** widget on the dashboard and in the **Diet Logs** section of the Records Board, both using a card-based layout with at most 3 cards per medical report.
 
 ---
 
@@ -19,13 +19,14 @@ The **Diet** feature logs a user's meals, medications, and dietary advice. Recor
 | `_id` | ObjectId | |
 | `userId` | ObjectId (ref `User`) | Owning user |
 | `mealType` | string | `BREAKFAST \| LUNCH \| DINNER \| SNACK \| CRAVINGS \| PILLS` |
-| `cardType` | string | `MEDICATION \| SUGGESTIONS \| MANDATORY_FOOD` (new) or legacy values |
+| `cardType` | string | `MEDICATION \| SUGGESTIONS \| MANDATORY_FOOD` or legacy values |
 | `date` | Date | Log date |
 | `source` | string | `USER \| DOCTOR \| AI` |
-| `reportGroupId` | string | UUID — links all docs from one report batch |
+| `reportGroupId` | string | UUID — links all documents from one report batch |
 | `reportLabel` | string | `"Dr. {name} · {date}"` — displayed on the card |
 | `items` | string[] | Food items or general text items |
 | `medicationItems` | MedItem[] | Populated only for `MEDICATION` card type |
+| `description` | string | Formatted text (medications or food items) |
 | `calories` | number | Optional calorie estimate |
 | `notes` | string | Free-text note |
 | `createdAt` | Date | Auto |
@@ -36,12 +37,12 @@ The **Diet** feature logs a user's meals, medications, and dietary advice. Recor
 interface MedItem {
   name: string;
   dosage?: string;
-  duration?: string;          // "30 days", "2 weeks"
-  instructions?: string;      // timing + how to take
-  sideEffects?: string[];     // key side effects to watch for
+  duration?: string;           // "30 days", "2 weeks"
+  instructions?: string;       // timing + how to take
+  sideEffects?: string[];      // key side effects to watch for
   avoidWhileTaking?: string[]; // foods, drugs, activities to avoid
-  startDate?: string;         // ISO date — equals visitDate
-  endDate?: string;           // ISO date — equals visitDate + duration
+  startDate?: string;          // ISO date — equals visitDate
+  endDate?: string;            // ISO date — equals visitDate + duration
 }
 ```
 
@@ -51,15 +52,11 @@ interface MedItem {
 
 | `cardType` | `mealType` | Contents | When created |
 |-----------|-----------|---------|-------------|
-| `MEDICATION` | `PILLS` | All mandatory daily medications, each as a full `MedItem` with side effects, avoid list, and start/end dates | Always if prescriptions exist |
-| `SUGGESTIONS` | `BREAKFAST` / etc. | Food advice, probiotics, general dietary tips as a plain text array | Always if dietary advice exists |
-| `MANDATORY_FOOD` | `BREAKFAST` / etc. | Specific foods the doctor mandates per day with exact quantities | Only if doctor explicitly mandates a food |
-
-Before Round 4, cards were created per-timing-slot (BEFORE_BREAKFAST, AFTER_BREAKFAST, etc.) producing 6–10 scattered cards per report. The max-3 constraint collapses all medications into a single `MEDICATION` card and all food advice into a single `SUGGESTIONS` card.
+| `MEDICATION` | `PILLS` | All mandatory daily medications, each as a full `MedItem` with side effects, avoid list, start/end dates | Always if prescriptions with `isDaily=true` exist |
+| `SUGGESTIONS` | `BREAKFAST` etc. | Food advice, probiotics, general dietary tips as a plain text array | Always if dietary advice exists |
+| `MANDATORY_FOOD` | `BREAKFAST` etc. | Doctor-mandated specific foods with exact quantities | Only if doctor explicitly mandates a food per day |
 
 ### Legacy card types (backward-compatible)
-
-The UI handles these for records created before Round 4:
 
 | Legacy `cardType` | Visual treatment |
 |-------------------|-----------------|
@@ -76,15 +73,17 @@ The UI handles these for records created before Round 4:
 |--------|-------|-------------|
 | `GET` | `/api/users/:id/diet-logs` | All diet logs for a user |
 | `POST` | `/api/users/:id/diet-logs` | Create a diet log entry |
+| `PUT` | `/api/users/:id/diet-logs/:logId` | Update a diet log (returns updated document) |
 | `DELETE` | `/api/users/:id/diet-logs/:logId` | Delete entry + remove Neo4j embedding |
-| `GET` | `/api/users/:userId/reminders` | Active (not done) reminders for a user |
+| `GET` | `/api/users/:userId/reminders` | Active (not done) reminders sorted by dueDate |
 | `PATCH` | `/api/users/:userId/reminders/:id/done` | Dismiss a reminder |
+| `POST` | `/api/agent/:userId/reanalyze-diet` | Diff old vs new diet log → LLM → re-embed |
 
 ---
 
 ## LangGraph Diet Pipeline
 
-The diet cards are produced inside `_storeReport()` in `agent.service.ts` after the LLM parses the medical report. The LLM system prompt instructs the model to output a `dietAdvice` array capped at 3 slots.
+Diet cards are produced inside `_storeReport()` in `agent.service.ts`. The LLM system prompt instructs the model to output a `dietAdvice` array capped at 3 slots.
 
 ### LLM output format
 
@@ -124,29 +123,97 @@ The diet cards are produced inside `_storeReport()` in `agent.service.ts` after 
 
 ```
 For each DietSlot in dietAdvice (max 3):
-  1. Build DietLog document:
-     { userId, mealType: slot.mealTypes[0], cardType: slot.cardType,
-       date: visitDate, items: slot.foodItems ?? [],
-       medicationItems: slot.medicationItems ?? [],
-       reportGroupId, reportLabel, source: 'DOCTOR' }
+  1. Build DietLog document
   2. Save to MongoDB
   3. embedAndStore(userId, id, 'DIET_LOG', serialized text, visitDate)
 ```
-
-After all diet cards are saved, the reminder creation block runs (see Reminders section).
 
 ---
 
 ## `startDate` / `endDate` Computation
 
-Rather than computing these in the backend service, the LLM is instructed to compute them directly inside the JSON output because it already knows both `visitDate` and `duration`:
+The LLM computes both values directly in the JSON output since it already knows `visitDate` and `duration`:
 
 ```
 startDate = visitDate
-endDate   = visitDate + duration (computed by the LLM)
+endDate   = visitDate + duration  (LLM computes this)
 ```
 
-The backend stores these as plain ISO strings and uses `endDate` when creating `MEDICATION_END` reminders.
+The backend stores them as plain ISO strings and uses `endDate` when creating `MEDICATION_END` reminders.
+
+---
+
+## Record Detail Panel — Diet Type
+
+`RecordDetailPanel` is a full-overlay modal (`z-60`, max-width 3xl) shared across all three record types. For diet logs:
+
+### View Mode
+
+**MEDICATION card view:**
+- Indigo-to-purple gradient header with report label and visit date
+- Per-drug accordion sections:
+  - Drug name + dosage + duration badge (bold header row)
+  - Clock icon + instructions text
+  - Start date tile (teal) + End date tile (rose) side by side
+  - Amber pills — one per entry in `sideEffects[]`
+  - Rose pills — one per entry in `avoidWhileTaking[]`
+
+**SUGGESTIONS / MANDATORY_FOOD card view:**
+- Teal or emerald gradient header
+- Each food item as a bullet row in a slate-50 card
+
+An **Edit** button in the header switches to edit mode.
+
+### Edit Mode
+
+**MEDICATION card edit:**
+- "Add medication" button to append a new empty `MedItem` row
+- Per-medication section (delete button per row):
+  - Name (full width), Dosage, Duration (2-col grid)
+  - Instructions (full width)
+  - Side effects — comma-separated input → splits to `string[]`
+  - Avoid while taking — comma-separated input → splits to `string[]`
+  - Start date picker, End date picker
+
+**SUGGESTIONS / MANDATORY_FOOD card edit:**
+- Multi-line textarea — one food item per line
+
+### Save & Analyse Flow
+
+```
+1. User clicks "Save & Analyse"
+2. PUT /api/users/:userId/diet-logs/:logId  { updated DietLog }
+3. POST /api/agent/:userId/reanalyze-diet  { oldLog, newLog }
+4. "Analysing..." spinner shown during step 3
+5. AI analysis rendered inline in the panel
+6. Panel switches back to view mode; record list refetched
+```
+
+---
+
+## `reanalyzeDietChanges` Pipeline
+
+```
+1. Diff old vs new:
+   - medsAdded   = newLog.medicationItems[].name not in oldLog
+   - medsRemoved = oldLog.medicationItems[].name not in newLog
+   - descChanged = oldLog.description !== newLog.description
+
+2. if !hasChanges → return { analysis: "No significant changes." }
+
+3. Build prompt:
+   "Diet log type: MEDICATION
+    Medications added: X
+    Medications removed: Y
+    Briefly assess clinical significance (2-3 sentences)."
+
+4. getLLM(modelId).invoke(systemPrompt + prompt)
+
+5. embedAndStore(userId, newLog._id, 'DIET_LOG', embedText, date)
+   [MERGE — overwrites stale Neo4j vector in-place]
+
+6. return { analysis }
+```
 
 ---
 
@@ -168,100 +235,57 @@ The backend stores these as plain ISO strings and uses `endDate` when creating `
 
 ### Auto-creation (from `_storeReport`)
 
-| `reminderType` | Created from | Default due date |
-|---------------|-------------|-----------------|
+| `reminderType` | Source | Default due date |
+|---------------|--------|-----------------|
 | `APPOINTMENT` | `parsedData.nextAppointment.date` | Exact date from report |
 | `FOLLOW_UP_TEST` | Each entry in `parsedData.followUpTests[]` | `visitDate + 30 days` if no date given |
 | `MEDICATION_END` | Each `MedItem` with a non-null `endDate` | `med.endDate` |
 
 ---
 
-## Reminders Widget (UI — UserDashboard)
+## Reminders Widget (UserDashboard)
 
-Shown above the Daily Diet panel. Fetches from `GET /api/users/:userId/reminders`.
+Shown above the Daily Diet panel. Fetches from `GET /api/users/:userId/reminders` on load.
 
-### Urgency colouring
+| Urgency | Ring/text colour | Condition |
+|---------|----------------|-----------|
+| Overdue | Rose | `dueDate < today` |
+| Soon | Amber | `dueDate ≤ today + 7 days` |
+| Later | Slate | `dueDate > today + 7 days` |
 
-| Condition | Ring/text colour | Label |
-|-----------|----------------|-------|
-| `dueDate < today` | Rose | Overdue |
-| `dueDate ≤ today + 7 days` | Amber | Due in N days |
-| `dueDate > today + 7 days` | Slate | Future date |
+Each row: type icon · title · countdown · `reportLabel` pill · ✓ dismiss button.
 
-### Reminder row
-
-Each reminder shows:
-- Icon by type: `CalendarCheck` (APPOINTMENT), `FlaskRound` (FOLLOW_UP_TEST), `AlarmClock` (MEDICATION_END)
-- Title and countdown text
-- `reportLabel` pill (links back to source report)
-- Dismiss button (`✓`) — calls `PATCH .../done`, removes from list optimistically
+Dismiss calls `PATCH .../reminders/:id/done` and removes the item from local state immediately (optimistic update).
 
 ---
 
-## Daily Diet Widget (UI — UserDashboard)
+## Daily Diet Widget (UserDashboard)
 
-Fetches today's `DietLog` entries. Cards are grouped by `reportGroupId` where applicable.
+Compact preview panel fetching today's `DietLog` entries.
 
-### MEDICATION card
+| Card type | Clickable | What happens on click |
+|-----------|-----------|----------------------|
+| `MEDICATION` | Yes | Opens `RecordDetailPanel` in view mode |
+| `SUGGESTIONS` | Yes | Opens `RecordDetailPanel` in view mode |
+| `MANDATORY_FOOD` | Yes | Opens `RecordDetailPanel` in view mode |
 
-- Clickable — opens the **Medication Detail Modal**
-- Shows inline: list of medication names with dosage and duration
-- Accent colour: indigo
-
-### SUGGESTIONS card
-
-- Non-clickable
-- Shows food items as a bullet list
-- Accent colour: teal
-
-### MANDATORY_FOOD card
-
-- Non-clickable
-- Shows mandated foods with quantities
-- Accent colour: emerald
+Previously only MEDICATION cards were clickable (opening a view-only modal). Now all cards open the full `RecordDetailPanel` with view + edit + re-analysis capability.
 
 ---
 
-## Medication Detail Modal
+## Records Board — Diet Cards
 
-Triggered when the user clicks a `MEDICATION` diet card. Full-screen-overlay modal with:
+The `RecordsBoard` component (endpoint = `diet-logs`) renders cards in board and timeline view.
 
-### Header
+**Every card is now clickable.** Clicking anywhere on a card opens the `RecordDetailPanel` for that log. Delete and quick-edit buttons in the card footer use `e.stopPropagation()` so they do not trigger the panel.
 
-Gradient banner showing the report label and visit date.
+### `MedItemRow` Component
 
-### Per-drug tiles
-
-Each `MedItem` rendered as an expandable section:
-
-| Section | Contents |
-|---------|---------|
-| Dosage & instructions | `dosage` · `instructions` |
-| Duration | `duration` text |
-| Start date tile (teal) | `startDate` formatted |
-| End date tile (rose) | `endDate` formatted |
-| Side effects | Amber pill tags: one per entry in `sideEffects[]` |
-| Avoid while taking | Rose pill tags: one per entry in `avoidWhileTaking[]` |
-
----
-
-## `MedItemRow` Component (Records Board)
-
-An extracted standalone component used inside the Records Board's board card renderer for `MEDICATION`-type diet log cards. It has its own `open` state (expandable) and renders:
-
-- Medication name + dosage
-- `▼` chevron to expand
-- Expanded: instructions, start/end date pills, side effects tags, avoid-list tags
-
-This component was extracted to fix a React hooks violation — `useState` cannot be called inside a `.map()` callback, so each row must be a proper function component.
+A standalone expandable row component used inside MEDICATION board cards. Each row has its own `open` state (avoids React hooks-in-map violation):
 
 ```tsx
-function MedItemRow({ med, timingBg, timingText }: {
-  med: MedLogItem;
-  timingBg: string;
-  timingText: string;
-}) {
+function MedItemRow({ med, timingBg, timingText }: { med: MedLogItem; ... }) {
   const [open, setOpen] = useState(false);
-  // ...
+  // chevron toggle → side effects / avoid list / start+end dates
 }
 ```

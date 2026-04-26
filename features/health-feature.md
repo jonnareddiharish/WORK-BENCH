@@ -1,12 +1,12 @@
 # Health Feature
 
-> Covers health event types, doctor report grouping, report group cards, edit & re-analysis flow, and Neo4j embedding lifecycle.
+> Covers health event types, doctor report grouping, the Record Detail Panel (view → edit → re-analysis), and Neo4j embedding lifecycle.
 
 ---
 
 ## Overview
 
-The **Health** feature stores and displays a user's longitudinal medical history. Health records arrive from three sources:
+The **Health** feature stores and displays a user's longitudinal medical history. Records arrive from three sources:
 
 | `source` | Description |
 |----------|-------------|
@@ -14,7 +14,7 @@ The **Health** feature stores and displays a user's longitudinal medical history
 | `DOCTOR` | Parsed from a doctor's report via the LangGraph pipeline |
 | `AI` | Generated or inferred by the AI agent |
 
-Every health record is embedded into Neo4j for semantic vector search, enabling the AI agent to retrieve relevant history at inference time.
+Every health record is embedded into Neo4j for semantic vector search so the AI agent can retrieve relevant history without full-profile joins.
 
 ---
 
@@ -29,7 +29,7 @@ Every health record is embedded into Neo4j for semantic vector search, enabling 
 | `eventType` | string | See table below |
 | `date` | Date | Event date |
 | `source` | string | `USER \| DOCTOR \| AI` |
-| `reportGroupId` | string | UUID — links all docs from one report batch |
+| `reportGroupId` | string | UUID — links all documents from one report batch |
 | `reportLabel` | string | `"Dr. {name} · {date}"` — displayed on cards |
 | `details` | object | Polymorphic — shape varies by `eventType` |
 | `status` | string | `ACTIVE \| RESOLVED \| ONGOING` |
@@ -51,11 +51,13 @@ Every health record is embedded into Neo4j for semantic vector search, enabling 
 ```typescript
 {
   name: string;
-  dosage?: string;
-  frequency?: string;
+  dosage: string;
+  frequency: string;
   duration?: string;
+  route: string;        // ORAL | INJECTION | TOPICAL | IV | OTHER
+  isDaily: boolean;
   instructions?: string;
-  status?: string;   // ACTIVE | COMPLETED
+  status?: string;      // ACTIVE | COMPLETED
 }
 ```
 
@@ -63,12 +65,11 @@ Every health record is embedded into Neo4j for semantic vector search, enabling 
 
 ```typescript
 {
-  name: string;
+  testName: string;
   value?: string;
-  unit?: string;
-  normalRange?: string;
-  status?: string;  // NORMAL | ABNORMAL | PENDING
-  notes?: string;
+  referenceRange?: string;
+  interpretation?: string;
+  status: string;       // NORMAL | ABNORMAL | BORDERLINE
 }
 ```
 
@@ -80,8 +81,9 @@ Every health record is embedded into Neo4j for semantic vector search, enabling 
 |--------|-------|-------------|
 | `GET` | `/api/users/:id/health-events` | All health events for a user |
 | `POST` | `/api/users/:id/health-events` | Create a health event |
-| `PUT` | `/api/users/:id/health-events/:eventId` | Edit a health event (triggers re-analysis) |
+| `PUT` | `/api/users/:id/health-events/:eventId` | Edit a health event (returns updated document) |
 | `DELETE` | `/api/users/:id/health-events/:eventId` | Delete event + remove Neo4j embedding |
+| `POST` | `/api/agent/:userId/reanalyze` | Diff old vs new health event → LLM → re-embed → profile update |
 
 ---
 
@@ -106,119 +108,136 @@ One report → reportGroupId = "abc-123"
 
 ## Health Records Board (UI)
 
-Located in `app.tsx` as the `RecordsBoard` component.
+Located in `app.tsx` as the `RecordsBoard` component (endpoint = `health-events`).
 
 ### Board View (default)
 
-Cards are grouped by `reportGroupId`. Each group shows:
-- A report header pill: `reportLabel` badge with coloured dot
-- Up to 3 event cards in the group, side by side
+Doctor-report groups are displayed as cards with an indigo header. Each card surfaces:
 
-#### Card colour profiles
+- Doctor name + specialty + hospital/address
+- Diagnoses as rose condition pills
+- Prescription: medication names + dosages (truncated)
+- Test results: test names + status badges
 
-| `eventType` | Header colour | Label |
-|-------------|-------------|-------|
-| `DOCTOR_VISIT` | Blue | Doctor Visit |
-| `PRESCRIPTION` | Purple | Prescription |
-| `TEST_RESULTS` | Emerald | Test Results |
-| `DIAGNOSIS` | Rose | Diagnosis |
-| `TREATMENT` | Orange | Treatment |
-| `MEDICATION` | Indigo | Medication |
-
-#### PRESCRIPTION card
-
-Renders `details.medications` as a table:
-
-| Column | Source |
-|--------|--------|
-| Medication name | `item.name` |
-| Dosage | `item.dosage` |
-| Frequency | `item.frequency` |
-| Duration | `item.duration` |
-| Instructions | `item.instructions` |
-| Status badge | `item.status` |
-
-#### TEST_RESULTS card
-
-Renders `details.testResults` as a table with a status badge (green = NORMAL, red = ABNORMAL, slate = PENDING).
-
-#### DOCTOR_VISIT card
-
-Shows conditions list, symptoms, injections (clinic-only), and doctor notes.
+User-logged events are shown in a separate "My Logs" grid below with colour-coded cards.
 
 ### Timeline View
 
-Toggled by the view-switcher button. Events are listed chronologically:
-- Each event shows a coloured dot, event type label, date, and source badge
-- Clicking expands the full card details inline
+Events listed chronologically with coloured dots, date, and expandable card sections.
 
-### Edit & Re-Analysis
+### Click → Record Detail Panel
 
-Each board card has an **Edit** icon (pencil). Clicking opens an edit modal pre-populated with the existing `details` object as formatted JSON.
-
-On save:
-1. `PUT /api/users/:id/health-events/:eventId` is called with the updated details
-2. The backend calls `AgentService.reanalyzeEventChanges(userId, before, after, eventType)`
-3. The LangGraph pipeline computes the semantic diff between old and new
-4. The AI assesses clinical significance (new conditions, changed medications, etc.)
-5. `AIPatientContext` is updated with any newly detected conditions/medications
-6. The Neo4j embedding for the event is deleted and re-created with the updated text
-
-This ensures a user-corrected record is treated as authoritatively as a freshly parsed report.
+**Every card is now clickable.** Clicking anywhere on a health group card (doctor-report or user-logged) opens the `RecordDetailPanel` for that group. The delete/edit buttons in the card footer use `e.stopPropagation()` to avoid triggering the panel.
 
 ---
 
-## Neo4j Embedding Lifecycle
+## Record Detail Panel — Health Type
 
-Every health event that enters the system (via any source) is embedded and stored in Neo4j for vector similarity search.
+`RecordDetailPanel` is a full-overlay modal (`z-60`, max-width 3xl) with a gradient header and two modes.
 
-### `embedAndStore(userId, documentId, type, text, date)`
+### View Mode
 
-1. Generate 384-dim embedding via HuggingFace `all-MiniLM-L6-v2` (local — no API key)
-2. `MERGE` a `UserHealthChunk` node keyed by `(userId, documentId)`
-3. Store embedding as a float array property
-4. Index via the `user_health_vector` vector index
+The panel opens in **view mode** displaying all parsed data richly formatted:
 
-### `findRelevantContext(userId, queryText, limit)`
+| Section | Contents |
+|---------|---------|
+| Header | Indigo-to-violet gradient; doctor name + specialty; hospital + address; report label; formatted full date |
+| Diagnoses & Findings | Condition pills (rose), symptoms list, injections at visit (amber), doctor notes in a slate block |
+| Prescription table | Columns: Medication name + isDaily badge + instructions · Dosage · Frequency · Duration · Route badge |
+| Test Results | Card per test: name, value, reference range, interpretation, status badge (rose/amber/emerald) |
 
-1. Embed the incoming query
-2. Run Neo4j `db.index.vector.queryNodes('user_health_vector', limit, embedding)`
-3. Filter results to `userId`
-4. Return top-8 ranked chunks
+An **Edit** button in the header switches to edit mode.
 
-The retrieved chunks are injected into the LLM prompt as compact context (~1 200 tokens vs 4 000–6 000 for a full profile dump).
+### Edit Mode
 
-### Delete
+Fields become editable:
 
-`deleteEmbedding(userId, documentId)` deletes the `UserHealthChunk` node:
+**Diagnoses & Visit section:**
+- Conditions — comma-separated text input splits to array
+- Visit summary — 2-row textarea
+- Doctor notes — 2-row textarea
+- Status selector — `ACTIVE | RESOLVED | ONGOING`
 
-```cypher
-MATCH (c:UserHealthChunk { userId: $userId, documentId: $documentId })
-DETACH DELETE c
+**Medications section (one row per drug):**
+- Name, Dosage, Frequency, Duration, Instructions — inline text inputs
+- Delete row button
+
+**Test Results section (one row per test):**
+- Test name shown read-only, Value input, Reference Range input, Status selector
+
+### Save & Analyse Flow
+
+```
+1. User clicks "Save & Analyse" in the panel footer
+2. PUT /api/users/:userId/health-events/:eventId  (for each changed event in the group)
+3. POST /api/agent/:userId/reanalyze  { oldEvent, newEvent }
+4. "Analysing..." spinner shown during step 3
+5. AI analysis result rendered in the panel below the edit fields
+   - "Profile Updated" badge shown if conditions/medications changed
+6. Panel switches back to view mode; fetches fresh record list
 ```
 
-This is called by:
-- `HealthEventsService.remove(eventId)`
-- `DietLogsService.remove(logId)`
-- `LifestyleService.remove(recordId)`
-- `AgentService.reanalyzeEventChanges` (before re-embedding the edited record)
+After close, the **analysis result is cleared** — it is not persisted (the corrected data in MongoDB is authoritative).
 
 ---
 
 ## Re-Analysis Pipeline (`reanalyzeEventChanges`)
 
 ```
-1. Build diff text: "Changed PRESCRIPTION: before=<old JSON>, after=<new JSON>"
-2. classifyIntent  → likely MEDICAL_REPORT or GENERAL_HEALTH
-3. retrieveContext → top-8 relevant chunks for userId
-4. LLM prompt:
-     "Given this user's profile and this edit, assess clinical significance.
-      Return: { newConditions[], removedConditions[], changedMedications[], summary }"
-5. Merge detected newConditions into AIPatientContext.conditions[]
-6. Merge changedMedications into AIPatientContext.medications[]
-7. deleteEmbedding(userId, eventId)
-8. embedAndStore(userId, eventId, 'HEALTH_EVENT', updatedText, date)
-9. Return assessment text → streamed back to UI as SSE response
+1. _computeEventDiff(oldEvent, newEvent)
+   → conditionsAdded[], conditionsRemoved[]
+   → medicationsAdded[], medicationsRemoved[]
+   → testStatusChanges[]
+   → descriptionChanged, statusChanged
+
+2. if !hasChanges → return { analysis: "No significant changes.", profileUpdated: false }
+
+3. _buildDiffPrompt(diff) → compact bullet list
+   "CONDITIONS ADDED: X | MEDICATIONS REMOVED: Y | ..."
+
+4. getLLM(modelId).invoke(systemPrompt + diffPrompt)
+   → 2–3 sentence clinical assessment
+
+5. embedAndStore(userId, eventId, 'HEALTH_EVENT', updatedText, date)
+   [MERGE — overwrites the stale Neo4j vector in-place]
+
+6. if conditionsAdded/Removed or medicationsAdded:
+   → userService.update(userId, { medicalConditions (set-dedup), medications })
+   → profileUpdated = true
+
+7. return { analysis, profileUpdated }
 ```
 
-The UI displays the re-analysis response in the same streaming chat area used for normal agent messages.
+---
+
+## Neo4j Embedding Lifecycle
+
+### Write
+
+`embedAndStore(userId, sourceId, chunkType, text, date)`:
+1. Generate 384-dim embedding via HuggingFace `all-MiniLM-L6-v2` (local — no API key)
+2. `MERGE (c:UserHealthChunk {id: $sourceId})` — creates or updates
+3. Sets `userId`, `chunkType`, `text`, `date`, `embedding`
+4. Indexed by the `userHealthChunks` vector index
+
+`MERGE` semantics mean re-embedding after an edit updates the node in-place — no duplicate chunks.
+
+### Retrieval
+
+```cypher
+CALL db.index.vector.queryNodes('userHealthChunks', 20, $queryVector)
+YIELD node AS c, score
+WHERE c.userId = $userId
+RETURN c.chunkType, c.text, c.date, score
+ORDER BY score DESC LIMIT 8
+```
+
+Top-8 chunks injected into the LLM prompt (~1 200 tokens, vs 4 000–6 000 for a full profile dump).
+
+### Delete
+
+`deleteEmbedding(sourceId)` — called by all three delete paths and by `reanalyzeEventChanges` before re-embedding:
+
+```cypher
+MATCH (c:UserHealthChunk {id: $sourceId}) DETACH DELETE c
+```

@@ -1,6 +1,6 @@
 # Family Health Tracker — Architecture & Design
 
-> **Implementation status**: Reflects the live codebase as of Round 4. Sections marked _(planned)_ describe future work not yet built.
+> **Implementation status**: Reflects the live codebase as of Round 5. Sections marked _(planned)_ describe future work not yet built.
 
 ---
 
@@ -67,6 +67,9 @@ work-bench/
 | No medication details | Per-drug side effects, avoid list, start/end dates in `medicationItems[]` |
 | No reminders | Automated reminder creation for appointments, tests, and medication end dates |
 | No re-analysis on edit | `reanalyzeEventChanges` computes diff → LLM assessment → re-embed → profile update |
+| No detail view before editing | `RecordDetailPanel`: view → edit → save & analyze for health, diet, and lifestyle |
+| Inconsistent edit entry point | All board and timeline cards clickable → opens unified `RecordDetailPanel` in view mode |
+| No diet / lifestyle re-analysis | `reanalyzeDietChanges` and `reanalyzeLifestyleChanges` — diff + LLM + re-embed for both types |
 
 ---
 
@@ -263,15 +266,32 @@ Reminders are exposed via `GET /api/users/:userId/reminders` and dismissed via `
 
 ## Edit & Re-Analysis Flow
 
-Users can correct parsed health records. The flow:
+All record cards (health, diet, lifestyle) follow a unified **view → edit → save & analyze** pattern via the `RecordDetailPanel` component.
 
-1. Click the pencil icon on a doctor-report group card in RecordsBoard.
-2. Edit modal opens with fields for DOCTOR_VISIT, PRESCRIPTION, TEST_RESULTS.
-3. **Save & Analyse**: PUTs each changed event → calls `POST /api/agent/:userId/reanalyze`.
-4. `reanalyzeEventChanges` diffs old vs new, runs LLM clinical assessment, re-embeds, updates profile.
-5. AI analysis shown inline; "Profile Updated" badge if conditions/medications changed.
+### UX Flow
 
-### `reanalyzeEventChanges` Pipeline
+1. Click anywhere on any report card in the Records Board or Daily Diet widget → opens `RecordDetailPanel` in **view mode** displaying all AI-generated details richly formatted.
+2. Click the **Edit** button in the panel header to switch to **edit mode** with inline-editable fields.
+3. Click **Save & Analyse**: PUTs updated records, then POSTs to the appropriate reanalyze endpoint.
+4. AI analysis rendered inline in the panel; panel returns to view mode and the record list is refreshed.
+5. Closing the panel clears the analysis result — the corrected data in MongoDB is the authoritative source.
+
+Delete and quick-edit buttons inside cards use `e.stopPropagation()` to prevent triggering the panel open.
+
+### `RecordDetailPanel` Component
+
+```typescript
+function RecordDetailPanel({ type, evs, record, userId, onClose, onRefetch }) {
+  // type: 'health' | 'diet' | 'lifestyle'
+  // evs: DetailEvs[] — for health groups (DOCTOR_VISIT + PRESCRIPTION + TEST_RESULTS)
+  // record: RecordItem — for diet and lifestyle single records
+  const [mode, setMode] = useState<'view' | 'edit'>('view');
+  // startEdit() — initializes edit state from current data
+  // handleSave() — PUT → POST reanalyze → setAnalysis → setMode('view') → onRefetch
+}
+```
+
+### `reanalyzeEventChanges` Pipeline (Health)
 
 ```
 1. _computeEventDiff(old, new)
@@ -281,11 +301,45 @@ Users can correct parsed health records. The flow:
 
 3. getLLM(modelId).invoke(systemPrompt + diffPrompt)
 
-4. embedAndStore(userId, newEvent._id, 'HEALTH_EVENT', text, date)  [overwrites stale vector]
+4. embedAndStore(userId, newEvent._id, 'HEALTH_EVENT', text, date)  [MERGE — overwrites stale vector]
 
 5. if conditions/medications changed → userService.update(userId, { medicalConditions, medications })
 
 6. return { analysis, profileUpdated }
+```
+
+### `reanalyzeDietChanges` Pipeline (Diet)
+
+```
+1. Diff medicationItems[].name arrays and description field
+   → medsAdded, medsRemoved, descChanged
+
+2. if !hasChanges → return { analysis: "No significant changes." }
+
+3. Build prompt: diet log type + medications added/removed → 2-3 sentence clinical assessment
+
+4. getLLM(modelId).invoke(systemPrompt + prompt)
+
+5. embedAndStore(userId, newLog._id, 'DIET_LOG', text, date)  [MERGE — overwrites stale vector]
+
+6. return { analysis }
+```
+
+### `reanalyzeLifestyleChanges` Pipeline (Lifestyle)
+
+```
+1. Diff description field and categories[] array
+   → descChanged, catsChanged
+
+2. if !hasChanges → return { analysis: "No significant changes." }
+
+3. Build prompt: categories changed + description → 2-3 sentence lifestyle assessment
+
+4. getLLM(modelId).invoke(systemPrompt + prompt)
+
+5. embedAndStore(userId, newRec._id, 'LIFESTYLE', text, date)  [MERGE — overwrites stale vector]
+
+6. return { analysis }
 ```
 
 ---
@@ -360,7 +414,9 @@ RETURN c.chunkType, c.text, c.date, score ORDER BY score DESC LIMIT 8
 | `POST` | `/api/agent/:userId/chat` | Blocking |
 | `POST` | `/api/agent/:userId/chat/stream` | SSE stream |
 | `POST` | `/api/agent/:userId/chat-with-file` | `multipart/form-data` PDF/image |
-| `POST` | `/api/agent/:userId/reanalyze` | Diff → LLM → re-embed → profile update |
+| `POST` | `/api/agent/:userId/reanalyze` | Diff → LLM → re-embed → profile update (health) |
+| `POST` | `/api/agent/:userId/reanalyze-diet` | Diff → LLM → re-embed (diet) |
+| `POST` | `/api/agent/:userId/reanalyze-lifestyle` | Diff → LLM → re-embed (lifestyle) |
 
 ### SSE Event Protocol
 
@@ -391,7 +447,31 @@ Clicking the ✓ button calls `PATCH .../reminders/:id/done` and removes the ite
 
 ---
 
-## Medication Cards — Expandable Detail
+## RecordDetailPanel — Universal Record Viewer
+
+`RecordDetailPanel` is a full-overlay modal (`z-60`, max-width 3xl) shared across all three record types (health, diet, lifestyle). It implements a **view → edit → save & analyze** flow.
+
+### View Mode
+
+| Record type | What is shown |
+|-------------|---------------|
+| **Health** | Gradient header with doctor info; Diagnoses + symptoms + injections + notes; Prescription table (name, dosage, frequency, duration, route); Test results per-card with status badges |
+| **Diet (MEDICATION)** | Indigo gradient header; per-drug accordion with clock + instructions, start/end date tiles, side effect pills (amber), avoid-while-taking pills (rose) |
+| **Diet (SUGGESTIONS / MANDATORY_FOOD)** | Teal/emerald gradient header; each food item as a bullet row |
+| **Lifestyle** | Category badges; description text block |
+
+The **Edit** button in the header switches the panel to edit mode.
+
+### Edit Mode
+
+| Record type | Editable fields |
+|-------------|----------------|
+| **Health** | Conditions (comma-sep), visit description, doctor notes, status selector; per-medication name/dosage/frequency/duration/instructions (add/delete rows); per-test value/range/status |
+| **Diet (MEDICATION)** | Per-medication name, dosage, duration, instructions, side effects (comma-sep → array), avoid list (comma-sep → array), start/end date pickers; add/delete rows |
+| **Diet (SUGGESTIONS / MANDATORY_FOOD)** | Multi-line textarea — one item per line |
+| **Lifestyle** | Description textarea; categories multi-select |
+
+### Medication Board Cards — Expandable Row Detail
 
 Each `MedItemRow` inside a MEDICATION board card can be expanded (via chevron) to reveal:
 - **Start date** (= visit date)
@@ -399,7 +479,7 @@ Each `MedItemRow` inside a MEDICATION board card can be expanded (via chevron) t
 - **Side Effects** — amber pills
 - **Avoid While Taking** — rose pills
 
-The `MedItemRow` is a standalone React component (not a hook-in-map) so each row carries its own open/close state independently.
+`MedItemRow` is a standalone React component so each row carries its own `open` state independently (avoids React hooks-in-map violation).
 
 ---
 
@@ -433,7 +513,9 @@ The `MedItemRow` is a standalone React component (not a hook-in-map) so each row
 | `POST` | `/api/agent/:id/chat` | Blocking chat |
 | `POST` | `/api/agent/:id/chat/stream` | SSE streaming chat |
 | `POST` | `/api/agent/:id/chat-with-file` | PDF/image upload → chat |
-| `POST` | `/api/agent/:id/reanalyze` | Diff + LLM + re-embed + profile update |
+| `POST` | `/api/agent/:id/reanalyze` | Diff + LLM + re-embed + profile update (health) |
+| `POST` | `/api/agent/:id/reanalyze-diet` | Diff + LLM + re-embed (diet) |
+| `POST` | `/api/agent/:id/reanalyze-lifestyle` | Diff + LLM + re-embed (lifestyle) |
 | `GET` | `/api/agent/models` | Available LLM models |
 
 ---
@@ -462,8 +544,8 @@ NEO4J_PASSWORD=
 
 | File | Status | Notes |
 |------|--------|-------|
-| `apps/api/src/app/agent/agent.service.ts` | ✅ Done | LangGraph · multi-model cache · `_storeReport` (3 health cards + max 3 diet cards + reminders) · `deleteEmbedding` · `reanalyzeEventChanges` |
-| `apps/api/src/app/agent/agent.controller.ts` | ✅ Done | All 5 endpoints |
+| `apps/api/src/app/agent/agent.service.ts` | ✅ Done | LangGraph · multi-model cache · `_storeReport` (3 health cards + max 3 diet cards + reminders) · `deleteEmbedding` · `reanalyzeEventChanges` · `reanalyzeDietChanges` · `reanalyzeLifestyleChanges` |
+| `apps/api/src/app/agent/agent.controller.ts` | ✅ Done | All 7 endpoints (chat, stream, file, reanalyze × 3, models) |
 | `apps/api/src/app/users/user.service.ts` | ✅ Done | All write paths embed · update re-embeds · deletes remove embeddings |
 | `apps/api/src/app/reminders/reminder.schema.ts` | ✅ Done | `APPOINTMENT \| FOLLOW_UP_TEST \| MEDICATION_END` · `dueDate`, `isDone` |
 | `apps/api/src/app/reminders/reminder.service.ts` | ✅ Done | `createMany`, `findByUser`, `markDone` |
@@ -471,7 +553,7 @@ NEO4J_PASSWORD=
 | `apps/api/src/app/health-events/health-event.schema.ts` | ✅ Done | `reportGroupId` · rich `details` |
 | `apps/api/src/app/diet-logs/diet-log.schema.ts` | ✅ Done | `reportGroupId` · `reportLabel` · `cardType` (MEDICATION/SUGGESTIONS/MANDATORY_FOOD) · `medicationItems` with `sideEffects`, `avoidWhileTaking`, `startDate`, `endDate` |
 | `apps/api/src/app/lifestyle/lifestyle.schema.ts` | ✅ Done | `reportGroupId` · `reportLabel` |
-| `apps/ui/src/app/app.tsx` | ✅ Done | All card types · `MedItemRow` expandable · Reminders widget · Medication detail modal · UserDashboard diet-card click-to-detail |
+| `apps/ui/src/app/app.tsx` | ✅ Done | All card types · `MedItemRow` expandable · Reminders widget · `RecordDetailPanel` (view → edit → save & analyze for health, diet, lifestyle) · all board and timeline cards clickable |
 | `apps/api/src/app/neo4j/neo4j.service.ts` | ✅ Done | `ensureVectorIndex()` at startup |
 | `apps/api/src/app/agent/agent.state.ts` | _(planned)_ | Interfaces inline in agent.service.ts |
 | `apps/api/src/app/agent/agent.graph.ts` | _(planned)_ | Graph inline in `buildGraph()` |
