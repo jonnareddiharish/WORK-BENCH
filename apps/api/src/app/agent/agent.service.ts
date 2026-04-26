@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Inject, forwardRef } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { UserService } from '../users/user.service';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatOpenAI } from '@langchain/openai';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
@@ -46,9 +47,23 @@ interface RetrievedChunk {
 }
 
 interface ParsedHealthData {
-  healthEvents?: { eventType: string; titles: string[]; description: string; status: string }[];
+  healthEvents?: {
+    eventType: string;        // DOCTOR_VISIT | DISEASE_DIAGNOSIS | MEDICATION | TREATMENT_START
+    titles: string[];
+    description: string;
+    status: string;
+    details?: {
+      doctorName?: string;
+      medicationName?: string;
+      dosage?: string;
+      symptoms?: string[];
+      doctorNotes?: string;
+    };
+  }[];
   dietAdvice?: { description: string; mealTypes: string[] }[];
   lifestyleAdvice?: { description: string; categories: string[] }[];
+  newConditions?: string[];   // pushed to user.medicalConditions
+  newMedications?: string[];  // pushed to user.medications
 }
 
 interface AgentState {
@@ -86,6 +101,7 @@ export class AgentService {
 
   constructor(
     private neo4jService: Neo4jService,
+    @Inject(forwardRef(() => UserService)) private userService: UserService,
     @InjectModel(HealthEvent.name) private healthEventModel: Model<HealthEventDocument>,
     @InjectModel(DietLog.name) private dietLogModel: Model<DietLogDocument>,
     @InjectModel(Lifestyle.name) private lifestyleModel: Model<LifestyleDocument>
@@ -241,78 +257,151 @@ export class AgentService {
     }
   }
 
+  // Robust JSON extractor — handles prose before/after and markdown code fences
+  private _extractJson(text: string): any {
+    let s = text
+      .replace(/^```json\s*/im, '')
+      .replace(/^```\s*/im, '')
+      .replace(/\s*```\s*$/m, '')
+      .trim();
+    const start = s.indexOf('{');
+    const end   = s.lastIndexOf('}');
+    if (start !== -1 && end > start) s = s.slice(start, end + 1);
+    return JSON.parse(s);
+  }
+
   private async _parseMedicalReport(message: string, llm: BaseChatModel): Promise<ParsedHealthData> {
+    const systemPrompt =
+      'You are a medical data extraction system. Extract ALL information from the medical report.\n' +
+      'Return ONLY a valid JSON object — no prose, no markdown fences, nothing else.\n\n' +
+      'Required JSON shape:\n' +
+      '{\n' +
+      '  "healthEvents": [\n' +
+      '    One DOCTOR_VISIT event for the consultation:\n' +
+      '    { "eventType": "DOCTOR_VISIT", "titles": ["<Visit type & doctor>"], "description": "<summary>", "status": "ACTIVE", "details": { "doctorName": "<name>", "doctorNotes": "<key findings>" } },\n' +
+      '    One DISEASE_DIAGNOSIS event PER diagnosis/finding:\n' +
+      '    { "eventType": "DISEASE_DIAGNOSIS", "titles": ["<diagnosis>"], "description": "<detail>", "status": "ACTIVE" },\n' +
+      '    One MEDICATION event PER prescribed medication:\n' +
+      '    { "eventType": "MEDICATION", "titles": ["<drug name>"], "description": "<freq, duration, instructions>", "status": "ACTIVE", "details": { "medicationName": "<name>", "dosage": "<dose & frequency>" } }\n' +
+      '  ],\n' +
+      '  "dietAdvice": [ { "description": "<one dietary instruction>", "mealTypes": ["BREAKFAST","LUNCH","DINNER"] } ],\n' +
+      '  "lifestyleAdvice": [ { "description": "<one lifestyle instruction>", "categories": ["EXERCISE","SLEEP","DIET"] } ],\n' +
+      '  "newConditions": ["<each diagnosis as a plain string>"],\n' +
+      '  "newMedications": ["<each medication with dosage as a plain string>"]\n' +
+      '}\n\n' +
+      'IMPORTANT: include EVERY diagnosis, EVERY medication, and EVERY advice item from the report.';
+
     try {
       const res = await llm.invoke([
-        new SystemMessage(
-          'Extract structured medical data from the report. Return ONLY valid JSON with this shape:\n' +
-          '{"healthEvents":[{"eventType":"DOCTOR_VISIT","titles":["..."],"description":"...","status":"ACTIVE"}],' +
-          '"dietAdvice":[{"description":"...","mealTypes":["BREAKFAST"]}],' +
-          '"lifestyleAdvice":[{"description":"...","categories":["EXERCISE"]}]}'
-        ),
-        new HumanMessage(message)
+        new SystemMessage(systemPrompt),
+        new HumanMessage(message),
       ]);
-      const raw = (res.content as string)
-        .replace(/^```json\n?/, '')
-        .replace(/\n?```$/, '')
-        .trim();
-      return JSON.parse(raw);
+      const parsed = this._extractJson(res.content as string);
+      this.logger.log(`parseMedicalReport: ${parsed.healthEvents?.length ?? 0} events, ${parsed.newConditions?.length ?? 0} conditions, ${parsed.newMedications?.length ?? 0} medications`);
+      return parsed;
     } catch (err: any) {
       this.logger.error('parseMedicalReport failed:', err.message);
-      return { healthEvents: [], dietAdvice: [], lifestyleAdvice: [] };
+      return { healthEvents: [], dietAdvice: [], lifestyleAdvice: [], newConditions: [], newMedications: [] };
     }
   }
 
   private async _storeReport(userId: string, parsedData: ParsedHealthData): Promise<string> {
-    const events = parsedData?.healthEvents ?? [];
-    for (const event of events) {
+    const today = new Date();
+    let savedEvents = 0;
+
+    // ── Save all health events (visits, diagnoses, medications) ───────────────
+    for (const event of parsedData?.healthEvents ?? []) {
       try {
         const titles = event.titles?.length
           ? event.titles
           : [event.description?.slice(0, 60) || 'Health Event'];
         const doc = await new this.healthEventModel({
-          ...event, titles, userId, source: 'AI', date: new Date(),
+          eventType:   event.eventType,
+          titles,
+          description: event.description,
+          status:      event.status || 'ACTIVE',
+          details:     event.details ?? {},
+          userId,
+          source: 'AI',
+          date:   today,
         }).save();
         const text = `${event.eventType} on ${doc.date.toISOString().slice(0, 10)}: ` +
                      `${titles.join(', ')} — ${event.description} (${event.status})`;
         await this.embedAndStore(userId, doc._id.toString(), 'HEALTH_EVENT', text, doc.date.toISOString());
+        savedEvents++;
       } catch (err: any) {
-        this.logger.error('storeHealthEvents error:', err.message);
+        this.logger.error(`store healthEvent [${event.eventType}] error:`, err.message);
       }
     }
 
-    const dietAdvice = parsedData?.dietAdvice ?? [];
-    for (const diet of dietAdvice) {
+    // ── Save diet advice ──────────────────────────────────────────────────────
+    let savedDiet = 0;
+    for (const diet of parsedData?.dietAdvice ?? []) {
       try {
         const doc = await new this.dietLogModel({
           userId, description: diet.description,
-          mealTypes: diet.mealTypes || [], source: 'DOCTOR', date: new Date(),
+          mealTypes: diet.mealTypes || [], source: 'DOCTOR', date: today,
         }).save();
         const text = `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${diet.description}`;
         await this.embedAndStore(userId, doc._id.toString(), 'DIET_LOG', text, doc.date.toISOString());
+        savedDiet++;
       } catch (err: any) {
-        this.logger.error('storeDietLogs error:', err.message);
+        this.logger.error('storeDietLog error:', err.message);
       }
     }
 
-    const lifestyleAdvice = parsedData?.lifestyleAdvice ?? [];
-    for (const ls of lifestyleAdvice) {
+    // ── Save lifestyle advice ─────────────────────────────────────────────────
+    let savedLifestyle = 0;
+    for (const ls of parsedData?.lifestyleAdvice ?? []) {
       try {
         const doc = await new this.lifestyleModel({
           userId, description: ls.description,
-          categories: ls.categories || [], source: 'DOCTOR', date: new Date(),
+          categories: ls.categories || [], source: 'DOCTOR', date: today,
         }).save();
         const text = `Doctor lifestyle advice on ${doc.date.toISOString().slice(0, 10)}: ${ls.description}`;
         await this.embedAndStore(userId, doc._id.toString(), 'LIFESTYLE', text, doc.date.toISOString());
+        savedLifestyle++;
       } catch (err: any) {
         this.logger.error('storeLifestyle error:', err.message);
       }
     }
 
-    const totalStored = events.length + dietAdvice.length + lifestyleAdvice.length;
-    return totalStored > 0
-      ? `I've analysed your medical report and saved ${totalStored} record(s) to your profile.`
-      : '';
+    // ── Update user profile: append new conditions & medications ─────────────
+    const newConditions  = (parsedData?.newConditions  ?? []).filter(Boolean);
+    const newMedications = (parsedData?.newMedications ?? []).filter(Boolean);
+    if (newConditions.length || newMedications.length) {
+      try {
+        const currentUser = await this.userService.findOne(userId);
+        if (currentUser) {
+          const mergedConditions = Array.from(new Set([
+            ...(currentUser.medicalConditions ?? []),
+            ...newConditions,
+          ]));
+          const mergedMedications = Array.from(new Set([
+            ...(currentUser.medications ?? []),
+            ...newMedications,
+          ]));
+          await this.userService.update(userId, {
+            medicalConditions: mergedConditions,
+            medications:       mergedMedications,
+          });
+        }
+      } catch (err: any) {
+        this.logger.warn('Failed to update user profile conditions/medications:', err.message);
+      }
+    }
+
+    const total = savedEvents + savedDiet + savedLifestyle;
+    if (total === 0) return '';
+
+    const parts: string[] = [];
+    if (savedEvents   > 0) parts.push(`${savedEvents} health record${savedEvents > 1 ? 's' : ''}`);
+    if (savedDiet     > 0) parts.push(`${savedDiet} diet note${savedDiet > 1 ? 's' : ''}`);
+    if (savedLifestyle > 0) parts.push(`${savedLifestyle} lifestyle tip${savedLifestyle > 1 ? 's' : ''}`);
+    if (newConditions.length  > 0) parts.push(`${newConditions.length} condition${newConditions.length > 1 ? 's' : ''} added to your profile`);
+    if (newMedications.length > 0) parts.push(`${newMedications.length} medication${newMedications.length > 1 ? 's' : ''} added to your profile`);
+
+    return `Saved: ${parts.join(', ')}.`;
   }
 
   private _buildProfileText(p: UserProfileSnapshot): string {
@@ -426,12 +515,33 @@ export class AgentService {
           this.logger.error('storeLifestyle error:', err.message);
         }
       }
+
+      // Update user profile with new conditions/medications extracted from report
+      const newConditions  = (state.parsedData?.newConditions  ?? []).filter(Boolean);
+      const newMedications = (state.parsedData?.newMedications ?? []).filter(Boolean);
+      if (newConditions.length || newMedications.length) {
+        try {
+          const currentUser = await this.userService.findOne(state.userId);
+          if (currentUser) {
+            await this.userService.update(state.userId, {
+              medicalConditions: Array.from(new Set([...(currentUser.medicalConditions ?? []), ...newConditions])),
+              medications:       Array.from(new Set([...(currentUser.medications ?? []), ...newMedications])),
+            });
+          }
+        } catch (err: any) {
+          this.logger.warn('Failed to update user profile conditions/medications:', err.message);
+        }
+      }
+
       const totalStored =
         (state.parsedData?.healthEvents?.length ?? 0) +
         (state.parsedData?.dietAdvice?.length ?? 0) +
         advice.length;
+      const parts: string[] = [`saved ${totalStored} record(s)`];
+      if (newConditions.length)  parts.push(`${newConditions.length} condition(s) added to profile`);
+      if (newMedications.length) parts.push(`${newMedications.length} medication(s) added to profile`);
       return {
-        storageFeedback: `I've analysed your medical report and saved ${totalStored} record(s) to your profile.`
+        storageFeedback: `I've analysed your medical report and ${parts.join(', ')}.`
       };
     };
 
