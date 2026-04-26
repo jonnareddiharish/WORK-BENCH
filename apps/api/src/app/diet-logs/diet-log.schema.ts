@@ -37,10 +37,10 @@ export class DietLog {
 
   // Card display metadata (set by LangGraph; absent on user-created records)
   @Prop()
-  cardType?: string; // MEAL | PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | DIETARY_ADVICE
+  cardType?: string; // MEDICATION | SUGGESTIONS | MANDATORY_FOOD
 
   @Prop()
-  timing?: string; // BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
+  timing?: string; // kept for legacy; new cards omit this field
 
   @Prop([Object])
   medicationItems?: {
@@ -48,6 +48,10 @@ export class DietLog {
     dosage?: string;
     duration?: string;
     instructions?: string;
+    sideEffects?: string[];
+    avoidWhileTaking?: string[];
+    startDate?: string; // ISO date — equals visitDate
+    endDate?: string;   // ISO date — equals visitDate + duration
   }[];
 }
 

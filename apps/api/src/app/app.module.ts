@@ -8,6 +8,7 @@ import { Neo4jModule } from './neo4j/neo4j.module';
 import { AgentModule } from './agent/agent.module';
 import { MealPlanModule } from './meal-plans/meal-plan.module';
 import { RecipeModule } from './recipes/recipe.module';
+import { ReminderModule } from './reminders/reminder.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { RecipeModule } from './recipes/recipe.module';
     AgentModule,
     MealPlanModule,
     RecipeModule,
+    ReminderModule,
   ],
   controllers: [AppController],
   providers: [AppService],

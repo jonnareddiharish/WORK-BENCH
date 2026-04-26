@@ -16,6 +16,8 @@ import { Model } from 'mongoose';
 import { HealthEvent, HealthEventDocument } from '../health-events/health-event.schema';
 import { DietLog, DietLogDocument } from '../diet-logs/diet-log.schema';
 import { Lifestyle, LifestyleDocument } from '../lifestyle/lifestyle.schema';
+import { Reminder, ReminderDocument } from '../reminders/reminder.schema';
+import { ReminderService } from '../reminders/reminder.service';
 
 // ── Available models ──────────────────────────────────────────────────────────
 
@@ -75,18 +77,21 @@ interface TestItem {
 interface MedItem {
   name: string;
   dosage?: string;
-  duration?: string;
-  instructions?: string;
+  duration?: string;         // e.g. "30 days", "2 weeks"
+  instructions?: string;     // timing + how to take, e.g. "1 tab before breakfast + 1 tab after dinner"
+  sideEffects?: string[];
+  avoidWhileTaking?: string[];
+  startDate?: string;        // ISO date string (= visitDate)
+  endDate?: string;          // ISO date string (= visitDate + duration)
 }
 
-// ONE diet card per meal-timing slot
+// MAX 3 diet cards per report
 interface DietSlot {
-  timing: string;           // BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL
-  cardType: string;         // PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | MEAL | DIETARY_ADVICE
-  mealTypes: string[];      // BREAKFAST | LUNCH | DINNER | SNACK | PILLS — DB display tags
-  medicationItems?: MedItem[]; // structured per-med rows for medication cards
-  foodItems?: string[];     // food/dietary advice items (plain text)
-  period?: string;          // overall duration when no per-item duration set
+  cardType: string;         // MEDICATION | SUGGESTIONS | MANDATORY_FOOD
+  mealTypes: string[];      // PILLS for MEDICATION; BREAKFAST/LUNCH/DINNER etc. for others
+  medicationItems?: MedItem[]; // structured per-med rows for MEDICATION cards
+  foodItems?: string[];     // food/dietary advice items (plain text) for SUGGESTIONS/MANDATORY_FOOD
+  period?: string;          // overall duration
 }
 
 interface ParsedHealthData {
@@ -111,10 +116,13 @@ interface ParsedHealthData {
     items: TestItem[];
     status: string;
   };
-  // ONE DietLog per timing slot (grouped by meal period)
+  // Max 3 diet cards: MEDICATION | SUGGESTIONS | MANDATORY_FOOD
   dietAdvice?: DietSlot[];
   // ONE Lifestyle record total — all items merged
   lifestyleAdvice?: { description: string; categories: string[] }[];
+  // Dashboard reminders
+  nextAppointment?: { date: string; description?: string };
+  followUpTests?: string[];
   newConditions?: string[];
   newMedications?: string[];
 }
@@ -157,7 +165,9 @@ export class AgentService {
     @Inject(forwardRef(() => UserService)) private userService: UserService,
     @InjectModel(HealthEvent.name) private healthEventModel: Model<HealthEventDocument>,
     @InjectModel(DietLog.name) private dietLogModel: Model<DietLogDocument>,
-    @InjectModel(Lifestyle.name) private lifestyleModel: Model<LifestyleDocument>
+    @InjectModel(Lifestyle.name) private lifestyleModel: Model<LifestyleDocument>,
+    @InjectModel(Reminder.name) private reminderModel: Model<ReminderDocument>,
+    private reminderService: ReminderService
   ) {
     this.ensureVectorIndex();
   }
@@ -373,18 +383,33 @@ export class AgentService {
       '  },',
       '',
       '  "dietAdvice": [',
-      '    CRITICAL: Group ALL diet-related content (food advice AND medications) by meal timing into slots. ONE slot per timing.',
-      '    cardType options: PRE_MEAL_MEDICATION (meds before a meal) | POST_MEAL_MEDICATION (meds after a meal) | MEAL (food advice for a meal) | DIETARY_ADVICE (general restrictions)',
-      '    timing options: BEFORE_BREAKFAST | AFTER_BREAKFAST | BEFORE_LUNCH | AFTER_LUNCH | BEFORE_DINNER | AFTER_DINNER | MORNING | EVENING | GENERAL',
-      '    mealTypes options: BREAKFAST | LUNCH | DINNER | SNACK | PILLS (always include PILLS when slot has medications)',
-      '    For MEDICATION slots use medicationItems[] with per-med name/dosage/duration/instructions.',
-      '    For MEAL or DIETARY_ADVICE slots use foodItems[] (plain text array).',
+      '    CRITICAL: Produce at most 3 diet cards total. Card type options:',
+      '    1. "MEDICATION" — one card with ALL mandatory daily medications (isDaily=true from prescriptions).',
+      '       Use medicationItems[] with full per-drug details.',
+      '       For each medication include:',
+      '         - sideEffects: array of key side effects (e.g. ["nausea on empty stomach", "drowsiness"])',
+      '         - avoidWhileTaking: array of foods/activities/drugs to avoid (e.g. ["grapefruit juice", "alcohol", "antacids within 2h"])',
+      '         - startDate: visitDate in ISO format',
+      '         - endDate: visitDate + duration in ISO format (compute from duration string)',
+      '         - instructions: full timing description, e.g. "1 tab before breakfast + 1 tab after dinner"',
+      '    2. "SUGGESTIONS" — one card with ALL food suggestions, probiotics, dietary advice, general tips.',
+      '       Use foodItems[] (plain text array).',
+      '    3. "MANDATORY_FOOD" — ONLY if doctor explicitly mandates a specific food per day (e.g. "2 tbsp ghee daily").',
+      '       Use foodItems[] (plain text array).',
       '    {',
-      '      "timing": "<timing key>",',
-      '      "cardType": "<PRE_MEAL_MEDICATION|POST_MEAL_MEDICATION|MEAL|DIETARY_ADVICE>",',
-      '      "mealTypes": ["<PILLS|BREAKFAST|LUNCH|DINNER|SNACK>"],',
+      '      "cardType": "<MEDICATION|SUGGESTIONS|MANDATORY_FOOD>",',
+      '      "mealTypes": ["PILLS"] for MEDICATION card, or ["BREAKFAST","LUNCH","DINNER"] etc. for food cards,',
       '      "medicationItems": [',
-      '        { "name": "<drug name>", "dosage": "<dose>", "duration": "<e.g. 30 days>", "instructions": "<e.g. 30 mins before food>" }',
+      '        {',
+      '          "name": "<drug name>",',
+      '          "dosage": "<dose>",',
+      '          "duration": "<e.g. 30 days>",',
+      '          "instructions": "<timing + how to take>",',
+      '          "sideEffects": ["<side effect>"],',
+      '          "avoidWhileTaking": ["<thing to avoid>"],',
+      '          "startDate": "<ISO date = visitDate>",',
+      '          "endDate": "<ISO date = visitDate + duration>"',
+      '        }',
       '      ],',
       '      "foodItems": ["<food advice text>"],',
       '      "period": "<overall duration if same for all items>"',
@@ -394,24 +419,24 @@ export class AgentService {
       '  "lifestyleAdvice": [',
       '    { "description": "<ONE lifestyle instruction>", "categories": ["<EXERCISE|SLEEP|STRESS|GENERAL|DIET>"] }',
       '  ],',
+      '  "nextAppointment": { "date": "<ISO date string or null>", "description": "<reason for next visit>" },',
+      '  "followUpTests": ["<test name required at follow-up>"],',
       '  "newConditions": ["<each diagnosis as plain string>"],',
       '  "newMedications": ["<medication name + dose as plain string>"]',
       '}',
       '',
-      'DIET GROUPING RULES (critical):',
-      '- Group medications AND food advice by when they are taken relative to meals.',
-      '  Example: All drugs taken 30 mins BEFORE breakfast → one BEFORE_BREAKFAST slot.',
-      '  Example: All drugs taken AFTER lunch → one AFTER_LUNCH slot.',
-      '  Example: General dietary restrictions (avoid coffee, eat small meals) → one GENERAL slot.',
-      '- A single slot may contain multiple medications AND food instructions if they share the same timing.',
-      '- Do NOT create a separate slot per medication — bundle everything for the same meal timing.',
-      '- If a drug has timing "1-0-0-1" (morning + night), split into BEFORE_BREAKFAST and BEFORE_DINNER slots.',
-      '- Include the drug name, dosage, and timing instruction in each items[] entry.',
+      'DIET CARD RULES (critical):',
+      '- Maximum 3 diet cards total. Do NOT create per-timing slots.',
+      '- MEDICATION card: bundle ALL daily home medications (tablets, capsules, tonics). Include side effects and avoid-list per drug.',
+      '- SUGGESTIONS card: ALL food/diet suggestions, probiotics, general dietary advice (avoid xyz, eat small meals, etc.).',
+      '- MANDATORY_FOOD card: ONLY emit this if doctor explicitly mandates a specific food per day with a quantity.',
+      '- If no food suggestions exist, omit SUGGESTIONS. If no mandatory foods, omit MANDATORY_FOOD.',
+      '- Do NOT include the same medication in both MEDICATION and any other card.',
       '',
       'OTHER RULES:',
       '- isDaily=true for tablets, capsules, tonics, syrups (taken at home); isDaily=false for hospital injections/IV',
       '- Injections given AT the clinic/hospital go in visitSummary.injections only, NOT in prescriptions',
-      '- Omit "visitSummary", "prescriptions", or "testResults" keys entirely if not present in the report',
+      '- Omit "visitSummary", "prescriptions", "testResults", "nextAppointment", "followUpTests" keys if not present',
       '- All arrays must be non-empty if the key is present',
     ].join('\n');
 
@@ -526,36 +551,35 @@ export class AgentService {
       }
     }
 
-    // ── Diet advice — ONE card per timing slot ────────────────────────────────
+    // ── Diet advice — max 3 cards: MEDICATION | SUGGESTIONS | MANDATORY_FOOD ──
     for (const slot of parsedData.dietAdvice ?? []) {
       const hasMeds  = (slot.medicationItems?.length ?? 0) > 0;
       const hasFood  = (slot.foodItems?.length ?? 0) > 0;
       if (!hasMeds && !hasFood) continue;
-      try {
-        const timingLabel = (slot.timing ?? 'GENERAL').replace(/_/g, ' ');
-        const periodSuffix = slot.period ? ` · ${slot.period}` : '';
 
-        // Build a plain-text description for embed / compact panel display
+      try {
+        const periodSuffix = slot.period ? ` · ${slot.period}` : '';
         let description: string;
+
         if (hasMeds) {
-          description = `${timingLabel}${periodSuffix}:\n` +
+          description = `Medications${periodSuffix}:\n` +
             slot.medicationItems!.map(m => {
               const parts = [m.name];
-              if (m.dosage) parts.push(m.dosage);
-              if (m.duration) parts.push(m.duration);
-              if (m.instructions) parts.push(`(${m.instructions})`);
+              if (m.dosage)        parts.push(m.dosage);
+              if (m.duration)      parts.push(m.duration);
+              if (m.instructions)  parts.push(`(${m.instructions})`);
               return `• ${parts.join(' — ')}`;
             }).join('\n');
         } else {
-          description = `${timingLabel}${periodSuffix}:\n${slot.foodItems!.map(f => `• ${f}`).join('\n')}`;
+          const cardLabel = slot.cardType === 'MANDATORY_FOOD' ? 'Mandatory Food' : 'Dietary Suggestions';
+          description = `${cardLabel}${periodSuffix}:\n${slot.foodItems!.map(f => `• ${f}`).join('\n')}`;
         }
 
         const doc = await new this.dietLogModel({
           userId,
           description,
           mealTypes:       slot.mealTypes?.length ? slot.mealTypes : ['GENERAL'],
-          cardType:        slot.cardType  ?? (hasMeds ? 'PRE_MEAL_MEDICATION' : 'DIETARY_ADVICE'),
-          timing:          slot.timing    ?? 'GENERAL',
+          cardType:        slot.cardType ?? (hasMeds ? 'MEDICATION' : 'SUGGESTIONS'),
           medicationItems: hasMeds ? slot.medicationItems : undefined,
           source: 'DOCTOR',
           date: today,
@@ -564,8 +588,8 @@ export class AgentService {
         }).save();
 
         const embedText = hasMeds
-          ? `Doctor ${slot.cardType ?? 'medication'} on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.medicationItems!.map(m => m.name).join(', ')}`
-          : `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)} [${timingLabel}]: ${slot.foodItems!.join('; ')}`;
+          ? `Doctor medications on ${doc.date.toISOString().slice(0, 10)}: ${slot.medicationItems!.map(m => m.name).join(', ')}`
+          : `Doctor diet advice on ${doc.date.toISOString().slice(0, 10)}: ${slot.foodItems!.join('; ')}`;
         await this.embedAndStore(userId, doc._id.toString(), 'DIET_LOG', embedText, doc.date.toISOString());
         dietSlotsSaved++;
       } catch (err: any) {
@@ -596,6 +620,69 @@ export class AgentService {
       } catch (err: any) {
         this.logger.error('storeLifestyle error:', err.message);
       }
+    }
+
+    // ── Create reminders (appointment + tests + medication ends) ─────────────
+    try {
+      const remindersToCreate: any[] = [];
+
+      // Next appointment reminder
+      if (parsedData.nextAppointment?.date) {
+        const apptDate = new Date(parsedData.nextAppointment.date);
+        if (!isNaN(apptDate.getTime())) {
+          remindersToCreate.push({
+            userId,
+            reminderType: 'APPOINTMENT',
+            title: parsedData.nextAppointment.description || 'Follow-up appointment',
+            dueDate: apptDate,
+            reportGroupId,
+            reportLabel,
+            isDone: false,
+          });
+        }
+      }
+
+      // Follow-up tests reminder (one per test)
+      for (const testName of parsedData.followUpTests ?? []) {
+        remindersToCreate.push({
+          userId,
+          reminderType: 'FOLLOW_UP_TEST',
+          title: `Follow-up test: ${testName}`,
+          dueDate: parsedData.nextAppointment?.date
+            ? new Date(parsedData.nextAppointment.date)
+            : new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000), // +30 days default
+          reportGroupId,
+          reportLabel,
+          isDone: false,
+        });
+      }
+
+      // Medication end reminders
+      for (const slot of parsedData.dietAdvice ?? []) {
+        if (slot.cardType !== 'MEDICATION') continue;
+        for (const med of slot.medicationItems ?? []) {
+          if (!med.endDate) continue;
+          const endDate = new Date(med.endDate);
+          if (!isNaN(endDate.getTime())) {
+            remindersToCreate.push({
+              userId,
+              reminderType: 'MEDICATION_END',
+              title: `${med.name} course ends`,
+              dueDate: endDate,
+              note: med.duration ? `Duration: ${med.duration}` : undefined,
+              reportGroupId,
+              reportLabel,
+              isDone: false,
+            });
+          }
+        }
+      }
+
+      if (remindersToCreate.length > 0) {
+        await this.reminderService.createMany(remindersToCreate);
+      }
+    } catch (err: any) {
+      this.logger.warn('Failed to create reminders:', err.message);
     }
 
     // ── Update user profile ───────────────────────────────────────────────────

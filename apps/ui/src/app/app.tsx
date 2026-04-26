@@ -36,6 +36,13 @@ import {
   Link2,
   MapPin,
   Building2,
+  Bell,
+  CalendarCheck,
+  FlaskRound,
+  AlarmClock,
+  ChevronDown,
+  Info,
+  ShieldAlert,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ForceGraph2D from 'react-force-graph-2d';
@@ -98,6 +105,10 @@ interface MedLogItem {
   dosage?: string;
   duration?: string;
   instructions?: string;
+  sideEffects?: string[];
+  avoidWhileTaking?: string[];
+  startDate?: string; // ISO
+  endDate?: string;   // ISO
 }
 
 interface DietLog {
@@ -109,9 +120,20 @@ interface DietLog {
   source?: string;
   reportGroupId?: string;
   reportLabel?: string;
-  cardType?: string;   // PRE_MEAL_MEDICATION | POST_MEAL_MEDICATION | MEAL | DIETARY_ADVICE
-  timing?: string;     // BEFORE_BREAKFAST | AFTER_BREAKFAST | etc.
+  cardType?: string;   // MEDICATION | SUGGESTIONS | MANDATORY_FOOD
+  timing?: string;
   medicationItems?: MedLogItem[];
+}
+
+interface Reminder {
+  _id: string;
+  reminderType: string; // APPOINTMENT | FOLLOW_UP_TEST | MEDICATION_END
+  title: string;
+  dueDate: string;
+  reportGroupId?: string;
+  reportLabel?: string;
+  isDone: boolean;
+  note?: string;
 }
 
 interface LifestyleRecord {
@@ -588,12 +610,15 @@ function UserDashboard() {
   const [healthEvents, setHealthEvents] = useState<HealthEvent[]>([]);
   const [dietLogs, setDietLogs] = useState<DietLog[]>([]);
   const [lifestyleRecords, setLifestyleRecords] = useState<LifestyleRecord[]>([]);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
   // Tab state for records
   const [healthTab, setHealthTab] = useState<'USER' | 'DOCTOR'>('USER');
   const [dietTab, setDietTab] = useState<'USER' | 'DOCTOR'>('USER');
   const [lifestyleTab, setLifestyleTab] = useState<'USER' | 'DOCTOR'>('USER');
   const [loading, setLoading] = useState(true);
   const [isExpanded, setIsExpanded] = useState(false);
+  // Medication detail modal
+  const [selectedMedCard, setSelectedMedCard] = useState<DietLog | null>(null);
 
   // Meal Plan state
   const [mealPlan, setMealPlan] = useState<MealPlan | null>(null);
@@ -653,24 +678,27 @@ function UserDashboard() {
 
   const fetchData = async () => {
     try {
-      const [userRes, eventsRes, logsRes, lifeRes, mealRes] = await Promise.all([
+      const [userRes, eventsRes, logsRes, lifeRes, mealRes, remindersRes] = await Promise.all([
         fetch(`http://localhost:3000/api/users/${userId}`),
         fetch(`http://localhost:3000/api/users/${userId}/health-events`),
         fetch(`http://localhost:3000/api/users/${userId}/diet-logs`),
         fetch(`http://localhost:3000/api/users/${userId}/lifestyle`),
         fetch(`http://localhost:3000/api/users/${userId}/meal-plans/active`),
+        fetch(`http://localhost:3000/api/users/${userId}/reminders`),
       ]);
-      
+
       const userData = await userRes.json();
       const eventsData = await eventsRes.json();
       const logsData = await logsRes.json();
       const lifeData = await lifeRes.json();
       const mealData = mealRes.ok ? await mealRes.json() : null;
-      
+      const remindersData = remindersRes.ok ? await remindersRes.json() : [];
+
       setUser(userData);
       setHealthEvents(eventsData);
       setDietLogs(logsData);
       setLifestyleRecords(lifeData);
+      setReminders(Array.isArray(remindersData) ? remindersData : []);
       if (mealData?._id) setMealPlan(mealData);
       if (userData?.mealPreferences) setMealPreferences(p => ({ ...p, ...userData.mealPreferences }));
     } catch (e) {
@@ -1721,8 +1749,65 @@ function UserDashboard() {
             </div>
           </div>
 
+          {/* ─── Reminders Widget ─── */}
+          {reminders.length > 0 && (
+            <div className="bg-white rounded-3xl p-6 shadow-sm border border-amber-100">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <div className="p-2 bg-amber-100 rounded-xl">
+                    <Bell className="w-4 h-4 text-amber-600" />
+                  </div>
+                  <h3 className="text-lg font-bold text-slate-800">Reminders</h3>
+                  <span className="text-[10px] font-black bg-amber-500 text-white px-2 py-0.5 rounded-full">{reminders.length}</span>
+                </div>
+              </div>
+              <div className="space-y-2.5 max-h-[280px] overflow-y-auto pr-1 scrollbar-hide">
+                {reminders.map(rem => {
+                  const due = new Date(rem.dueDate);
+                  const today = new Date();
+                  const diffDays = Math.ceil((due.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+                  const isOverdue = diffDays < 0;
+                  const isSoon = diffDays >= 0 && diffDays <= 7;
+                  const icon = rem.reminderType === 'APPOINTMENT' ? CalendarCheck
+                             : rem.reminderType === 'FOLLOW_UP_TEST' ? FlaskRound
+                             : AlarmClock;
+                  const IconComp = icon;
+                  return (
+                    <div key={rem._id} className={`flex items-start gap-3 p-3 rounded-2xl border transition-colors ${
+                      isOverdue ? 'bg-rose-50 border-rose-200' : isSoon ? 'bg-amber-50 border-amber-200' : 'bg-slate-50 border-slate-100'
+                    }`}>
+                      <IconComp className={`w-4 h-4 mt-0.5 flex-shrink-0 ${isOverdue ? 'text-rose-500' : isSoon ? 'text-amber-500' : 'text-slate-400'}`} />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-slate-800 line-clamp-1">{rem.title}</p>
+                        <p className={`text-[10px] font-bold mt-0.5 ${isOverdue ? 'text-rose-600' : isSoon ? 'text-amber-600' : 'text-slate-400'}`}>
+                          {isOverdue ? `${Math.abs(diffDays)}d overdue` : diffDays === 0 ? 'Today' : `In ${diffDays} day${diffDays !== 1 ? 's' : ''}`}
+                          {' · '}{due.toLocaleDateString()}
+                        </p>
+                        {rem.reportLabel && (
+                          <span className="flex items-center gap-1 mt-1 text-[9px] font-bold text-indigo-500 bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 rounded-full w-fit">
+                            <Link2 className="w-2.5 h-2.5" />{rem.reportLabel}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        onClick={async () => {
+                          await fetch(`http://localhost:3000/api/users/${userId}/reminders/${rem._id}/done`, { method: 'PATCH' });
+                          setReminders(prev => prev.filter(r => r._id !== rem._id));
+                        }}
+                        className="p-1.5 hover:bg-emerald-100 rounded-lg text-slate-300 hover:text-emerald-600 transition-colors flex-shrink-0"
+                        title="Mark as done"
+                      >
+                        <CheckCircle2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div className="bg-white rounded-3xl p-6 shadow-sm border border-slate-200">
-            <div 
+            <div
               className="flex items-center justify-between mb-4 cursor-pointer group/header"
               onClick={() => navigate(`/users/${userId}/diet-notes`)}
             >
@@ -1749,21 +1834,57 @@ function UserDashboard() {
               {dietLogs.filter(d => (d.source || 'USER') === dietTab).length === 0 ? (
                 <p className="text-sm text-slate-400 italic py-4 text-center">No {dietTab === 'USER' ? 'logs' : 'advice'} found.</p>
               ) : (
-                dietLogs.filter(d => (d.source || 'USER') === dietTab).map(log => (
-                  <div key={log._id} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
-                    <p className="text-xs text-slate-400 font-medium mb-0.5 flex justify-between">
-                      <span>{new Date(log.date).toLocaleDateString()}</span>
-                      {log.reportLabel ? (
-                        <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 rounded-full">
-                          <Link2 className="w-2.5 h-2.5" />{log.reportLabel}
-                        </span>
-                      ) : log.source === 'DOCTOR' && <span className="font-black text-indigo-500 uppercase text-[9px]">Professional</span>}
-                    </p>
-                    <p className="text-sm font-semibold text-slate-800 line-clamp-2">
-                      {log.description}
-                    </p>
-                  </div>
-                ))
+                dietLogs.filter(d => (d.source || 'USER') === dietTab).map(log => {
+                  const isMedCard = log.cardType === 'MEDICATION';
+                  const isSuggestion = log.cardType === 'SUGGESTIONS';
+                  const isMandatoryFood = log.cardType === 'MANDATORY_FOOD';
+                  return (
+                    <div
+                      key={log._id}
+                      className={`p-3 border rounded-xl transition-all ${
+                        isMedCard ? 'border-indigo-200 bg-indigo-50/50 cursor-pointer hover:bg-indigo-100/60 hover:shadow-sm' :
+                        isSuggestion ? 'border-teal-100 bg-teal-50/30 hover:bg-teal-50' :
+                        isMandatoryFood ? 'border-emerald-100 bg-emerald-50/30 hover:bg-emerald-50' :
+                        'border-slate-100 hover:bg-slate-50'
+                      }`}
+                      onClick={() => isMedCard ? setSelectedMedCard(log) : undefined}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-1.5">
+                          {isMedCard && <Pill className="w-3 h-3 text-indigo-500" />}
+                          {isSuggestion && <Leaf className="w-3 h-3 text-teal-500" />}
+                          {isMandatoryFood && <Apple className="w-3 h-3 text-emerald-500" />}
+                          <span className={`text-[9px] font-black uppercase tracking-wider ${isMedCard ? 'text-indigo-500' : isSuggestion ? 'text-teal-500' : isMandatoryFood ? 'text-emerald-500' : 'text-slate-400'}`}>
+                            {isMedCard ? 'Medications' : isSuggestion ? 'Suggestions' : isMandatoryFood ? 'Mandatory' : new Date(log.date).toLocaleDateString()}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {log.reportLabel && (
+                            <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 rounded-full">
+                              <Link2 className="w-2.5 h-2.5" />{log.reportLabel}
+                            </span>
+                          )}
+                          {isMedCard && <ChevronRight className="w-3 h-3 text-indigo-400" />}
+                        </div>
+                      </div>
+                      {isMedCard ? (
+                        <div className="space-y-1">
+                          {(log.medicationItems || []).slice(0, 3).map((m, i) => (
+                            <p key={i} className="text-xs text-slate-700 font-semibold">
+                              {m.name}{m.dosage && <span className="font-normal text-slate-500"> · {m.dosage}</span>}
+                              {m.duration && <span className="font-normal text-slate-400"> · {m.duration}</span>}
+                            </p>
+                          ))}
+                          {(log.medicationItems || []).length > 3 && (
+                            <p className="text-[10px] text-indigo-500 font-medium">+{(log.medicationItems!.length - 3)} more</p>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-sm font-semibold text-slate-800 line-clamp-2">{log.description}</p>
+                      )}
+                    </div>
+                  );
+                })
               )}
             </div>
           </div>
@@ -1816,6 +1937,124 @@ function UserDashboard() {
           </div>
         </div>
       </div>
+
+      {/* Medication Detail Modal */}
+      {selectedMedCard && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl w-full max-w-lg shadow-2xl border border-slate-200 animate-in zoom-in-95 duration-200 overflow-hidden max-h-[90vh] flex flex-col">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-indigo-600 to-purple-600 px-6 pt-6 pb-5 text-white flex-shrink-0">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <Pill className="w-5 h-5 text-indigo-200" />
+                  <span className="text-[10px] font-black uppercase tracking-widest text-indigo-200">Medication Details</span>
+                </div>
+                <button onClick={() => setSelectedMedCard(null)} className="p-1.5 hover:bg-white/20 rounded-xl transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              {selectedMedCard.reportLabel && (
+                <div className="flex items-center gap-1.5 mt-2">
+                  <Link2 className="w-3 h-3 text-indigo-300" />
+                  <span className="text-[10px] font-bold text-indigo-200">{selectedMedCard.reportLabel}</span>
+                </div>
+              )}
+              <p className="text-[10px] text-indigo-300 mt-1">{new Date(selectedMedCard.date).toLocaleDateString()}</p>
+            </div>
+
+            {/* Body */}
+            <div className="overflow-y-auto flex-1 p-6 space-y-4">
+              {(selectedMedCard.medicationItems || []).map((med, i) => (
+                <div key={i} className="border border-slate-200 rounded-2xl overflow-hidden">
+                  {/* Med header */}
+                  <div className="bg-indigo-50 px-4 py-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-bold text-slate-800">{med.name}</p>
+                      {med.dosage && <p className="text-[10px] text-slate-500 mt-0.5">{med.dosage}</p>}
+                    </div>
+                    {med.duration && (
+                      <span className="text-[10px] font-black bg-indigo-600 text-white px-2.5 py-1 rounded-full flex-shrink-0">{med.duration}</span>
+                    )}
+                  </div>
+
+                  <div className="px-4 py-3 space-y-3">
+                    {/* Instructions */}
+                    {med.instructions && (
+                      <div className="flex items-start gap-2">
+                        <Clock className="w-3.5 h-3.5 text-teal-500 mt-0.5 flex-shrink-0" />
+                        <p className="text-xs text-slate-600">{med.instructions}</p>
+                      </div>
+                    )}
+
+                    {/* Dates */}
+                    {(med.startDate || med.endDate) && (
+                      <div className="flex gap-3">
+                        {med.startDate && (
+                          <div className="flex-1 bg-teal-50 rounded-xl p-2.5 border border-teal-100">
+                            <p className="text-[9px] font-black uppercase text-teal-500 tracking-wider mb-1">Starts</p>
+                            <p className="text-xs font-bold text-teal-800">{new Date(med.startDate).toLocaleDateString()}</p>
+                          </div>
+                        )}
+                        {med.endDate && (
+                          <div className="flex-1 bg-rose-50 rounded-xl p-2.5 border border-rose-100">
+                            <p className="text-[9px] font-black uppercase text-rose-500 tracking-wider mb-1">Ends</p>
+                            <p className="text-xs font-bold text-rose-800">{new Date(med.endDate).toLocaleDateString()}</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Side effects */}
+                    {(med.sideEffects || []).length > 0 && (
+                      <div>
+                        <div className="flex items-center gap-1.5 mb-1.5">
+                          <Info className="w-3.5 h-3.5 text-amber-500" />
+                          <p className="text-[10px] font-black uppercase text-amber-600 tracking-wider">Possible Side Effects</p>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {med.sideEffects!.map((se, j) => (
+                            <span key={j} className="text-[10px] bg-amber-50 text-amber-700 border border-amber-100 px-2 py-0.5 rounded-full">{se}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Avoid while taking */}
+                    {(med.avoidWhileTaking || []).length > 0 && (
+                      <div>
+                        <div className="flex items-center gap-1.5 mb-1.5">
+                          <ShieldAlert className="w-3.5 h-3.5 text-rose-500" />
+                          <p className="text-[10px] font-black uppercase text-rose-600 tracking-wider">Avoid While Taking</p>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {med.avoidWhileTaking!.map((a, j) => (
+                            <span key={j} className="text-[10px] bg-rose-50 text-rose-700 border border-rose-100 px-2 py-0.5 rounded-full">{a}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {/* Food items (for SUGGESTIONS / MANDATORY_FOOD cards) */}
+              {(selectedMedCard.medicationItems || []).length === 0 && (
+                <div className="space-y-2">
+                  {selectedMedCard.description?.split('\n').filter(l => l.trim()).map((line, i) => (
+                    <p key={i} className="text-sm text-slate-600 leading-relaxed">{line}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-slate-100 px-6 py-4 flex-shrink-0">
+              <button onClick={() => setSelectedMedCard(null)} className="w-full py-2.5 text-sm font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Health Event Modal */}
       {isHealthModalOpen && (
@@ -2149,7 +2388,7 @@ interface RecordItem {
   status?: string;
   reportLabel?: string;
   source?: string;
-  cardType?: string;
+  cardType?: string;   // MEDICATION | SUGGESTIONS | MANDATORY_FOOD
   timing?: string;
   medicationItems?: MedLogItem[];
 }
@@ -2167,6 +2406,72 @@ type EditableHealthGroup = {
   testResults: TestItem[];
   testStatus: string;
 };
+
+// ── Expandable medication row used inside board cards ───────────────��──────────
+function MedItemRow({ med, timingBg, timingText }: { med: MedLogItem; timingBg: string; timingText: string }) {
+  const [open, setOpen] = useState(false);
+  const hasDetail = !!(med.sideEffects?.length || med.avoidWhileTaking?.length || med.startDate || med.endDate);
+  return (
+    <div className="bg-white/80 rounded-xl border border-white/80 shadow-sm overflow-hidden">
+      <button
+        className="w-full px-3 py-2 flex items-start justify-between gap-2 text-left hover:bg-white/60 transition-colors"
+        onClick={() => hasDetail && setOpen(o => !o)}
+      >
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-bold text-slate-800 leading-snug">{med.name}</p>
+          {med.dosage && <p className="text-[10px] text-slate-500 mt-0.5">{med.dosage}</p>}
+          {med.instructions && <p className="text-[10px] text-slate-400 italic mt-0.5 line-clamp-1">{med.instructions}</p>}
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {med.duration && (
+            <span className={`text-[9px] font-black px-2 py-0.5 rounded-full ${timingBg} ${timingText} border border-current/10`}>{med.duration}</span>
+          )}
+          {hasDetail && <ChevronDown className={`w-3.5 h-3.5 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`} />}
+        </div>
+      </button>
+      {open && (
+        <div className="px-3 pb-3 pt-1 border-t border-slate-100 bg-slate-50/80 space-y-2">
+          {(med.startDate || med.endDate) && (
+            <div className="flex gap-2">
+              {med.startDate && (
+                <div className="flex-1 bg-teal-50 rounded-lg p-2 border border-teal-100">
+                  <p className="text-[8px] font-black uppercase text-teal-500 mb-0.5">Starts</p>
+                  <p className="text-[10px] font-bold text-teal-800">{new Date(med.startDate).toLocaleDateString()}</p>
+                </div>
+              )}
+              {med.endDate && (
+                <div className="flex-1 bg-rose-50 rounded-lg p-2 border border-rose-100">
+                  <p className="text-[8px] font-black uppercase text-rose-500 mb-0.5">Ends</p>
+                  <p className="text-[10px] font-bold text-rose-800">{new Date(med.endDate).toLocaleDateString()}</p>
+                </div>
+              )}
+            </div>
+          )}
+          {(med.sideEffects || []).length > 0 && (
+            <div>
+              <p className="text-[8px] font-black uppercase text-amber-600 tracking-wider mb-1 flex items-center gap-1"><Info className="w-3 h-3" />Side Effects</p>
+              <div className="flex flex-wrap gap-1">
+                {med.sideEffects!.map((se, j) => (
+                  <span key={j} className="text-[9px] bg-amber-50 text-amber-700 border border-amber-100 px-1.5 py-0.5 rounded-full">{se}</span>
+                ))}
+              </div>
+            </div>
+          )}
+          {(med.avoidWhileTaking || []).length > 0 && (
+            <div>
+              <p className="text-[8px] font-black uppercase text-rose-600 tracking-wider mb-1 flex items-center gap-1"><ShieldAlert className="w-3 h-3" />Avoid</p>
+              <div className="flex flex-wrap gap-1">
+                {med.avoidWhileTaking!.map((a, j) => (
+                  <span key={j} className="text-[9px] bg-rose-50 text-rose-700 border border-rose-100 px-1.5 py-0.5 rounded-full">{a}</span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: string, endpoint: string, typeLabel: string, icon: any }) {
   const [records, setRecords] = useState<RecordItem[]>([]);
@@ -2682,19 +2987,22 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
           {endpoint !== 'health-events' && records.map((rec, idx) => {
             if (editingId === rec._id) return null;
 
-            // ── Diet card type resolution ────────────────────────────────────
-            const isMedCard = rec.cardType === 'PRE_MEAL_MEDICATION' || rec.cardType === 'POST_MEAL_MEDICATION';
-            const isFoodCard = rec.cardType === 'MEAL';
-            const isAdviceCard = rec.cardType === 'DIETARY_ADVICE';
-            const hasMedItems = (rec.medicationItems?.length ?? 0) > 0;
+            const isMedCard       = rec.cardType === 'MEDICATION';
+            const isSuggestions   = rec.cardType === 'SUGGESTIONS';
+            const isMandatoryFood = rec.cardType === 'MANDATORY_FOOD';
+            const hasMedItems     = (rec.medicationItems?.length ?? 0) > 0;
 
             type CardProfile = { label: string; border: string; bg: string; header: string; headerText: string; timingBg: string; timingText: string; tagBg: string };
             const cardProfile: CardProfile = (() => {
-              if (rec.cardType === 'PRE_MEAL_MEDICATION')  return { label: 'Pre-Meal Medication',  border: 'border-amber-200',  bg: 'bg-amber-50',   header: 'bg-amber-500',   headerText: 'text-white',      timingBg: 'bg-amber-100',  timingText: 'text-amber-800', tagBg: 'bg-amber-100/60' };
-              if (rec.cardType === 'POST_MEAL_MEDICATION') return { label: 'Post-Meal Medication', border: 'border-blue-200',   bg: 'bg-blue-50',    header: 'bg-blue-500',    headerText: 'text-white',      timingBg: 'bg-blue-100',   timingText: 'text-blue-800',  tagBg: 'bg-blue-100/60'  };
-              if (rec.cardType === 'MEAL')                 return { label: 'Meal',                 border: 'border-emerald-200',bg: 'bg-emerald-50', header: 'bg-emerald-500', headerText: 'text-white',      timingBg: 'bg-emerald-100',timingText: 'text-emerald-800',tagBg:'bg-emerald-100/60'};
-              if (rec.cardType === 'DIETARY_ADVICE')       return { label: 'Dietary Advice',       border: 'border-teal-200',   bg: 'bg-teal-50',    header: 'bg-teal-500',    headerText: 'text-white',      timingBg: 'bg-teal-100',   timingText: 'text-teal-800',  tagBg: 'bg-teal-100/60'  };
-              // fallback: lifestyle or generic
+              if (isMedCard)       return { label: 'Medications',      border: 'border-indigo-200', bg: 'bg-indigo-50',   header: 'bg-indigo-600', headerText: 'text-white', timingBg: 'bg-indigo-100', timingText: 'text-indigo-800', tagBg: 'bg-indigo-100/60' };
+              if (isSuggestions)   return { label: 'Suggestions',      border: 'border-teal-200',   bg: 'bg-teal-50',     header: 'bg-teal-500',   headerText: 'text-white', timingBg: 'bg-teal-100',   timingText: 'text-teal-800',   tagBg: 'bg-teal-100/60'   };
+              if (isMandatoryFood) return { label: 'Mandatory Food',   border: 'border-emerald-200',bg: 'bg-emerald-50',  header: 'bg-emerald-500',headerText: 'text-white', timingBg: 'bg-emerald-100',timingText: 'text-emerald-800',tagBg: 'bg-emerald-100/60'};
+              // legacy card types (backward compat)
+              if (rec.cardType === 'PRE_MEAL_MEDICATION')  return { label: 'Pre-Meal Medication',  border: 'border-amber-200',  bg: 'bg-amber-50',   header: 'bg-amber-500',   headerText: 'text-white', timingBg: 'bg-amber-100',  timingText: 'text-amber-800',  tagBg: 'bg-amber-100/60'  };
+              if (rec.cardType === 'POST_MEAL_MEDICATION') return { label: 'Post-Meal Medication', border: 'border-blue-200',   bg: 'bg-blue-50',    header: 'bg-blue-500',    headerText: 'text-white', timingBg: 'bg-blue-100',   timingText: 'text-blue-800',   tagBg: 'bg-blue-100/60'   };
+              if (rec.cardType === 'MEAL')                 return { label: 'Meal',                 border: 'border-emerald-200',bg: 'bg-emerald-50', header: 'bg-emerald-500', headerText: 'text-white', timingBg: 'bg-emerald-100',timingText: 'text-emerald-800',tagBg: 'bg-emerald-100/60'};
+              if (rec.cardType === 'DIETARY_ADVICE')       return { label: 'Dietary Advice',       border: 'border-teal-200',   bg: 'bg-teal-50',    header: 'bg-teal-500',    headerText: 'text-white', timingBg: 'bg-teal-100',   timingText: 'text-teal-800',   tagBg: 'bg-teal-100/60'   };
+              // generic lifestyle fallback
               const palettes: CardProfile[] = [
                 { label: typeLabel, border: 'border-[#FFECB3]', bg: 'bg-[#FFF9E5]', header: 'bg-amber-400',   headerText: 'text-amber-900',  timingBg: 'bg-amber-100',  timingText: 'text-amber-900',  tagBg: 'bg-white/40' },
                 { label: typeLabel, border: 'border-[#D1E9FF]', bg: 'bg-[#EBF5FF]', header: 'bg-blue-400',    headerText: 'text-blue-900',   timingBg: 'bg-blue-100',   timingText: 'text-blue-900',   tagBg: 'bg-white/40' },
@@ -2706,10 +3014,8 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
             })();
 
             const timingLabel = rec.timing ? rec.timing.replace(/_/g, ' ') : '';
-            // Extract period from description first line if present (e.g. "BEFORE BREAKFAST · 30 days:")
             const periodMatch = rec.description?.match(/·\s*([^:]+):/);
             const period = periodMatch ? periodMatch[1].trim() : '';
-
             const tags = (rec.mealTypes || rec.categories || []).filter(t => t !== rec.cardType);
 
             return (
@@ -2717,10 +3023,14 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
 
                 {/* Card header band */}
                 <div className={`${cardProfile.header} px-5 py-3 flex items-center justify-between`}>
-                  <span className={`text-[10px] font-black uppercase tracking-widest ${cardProfile.headerText}`}>{cardProfile.label}</span>
+                  <div className="flex items-center gap-2">
+                    {isMedCard && <Pill className="w-3.5 h-3.5 text-indigo-200" />}
+                    {isSuggestions && <Leaf className="w-3.5 h-3.5 text-teal-100" />}
+                    {isMandatoryFood && <Apple className="w-3.5 h-3.5 text-emerald-100" />}
+                    <span className={`text-[10px] font-black uppercase tracking-widest ${cardProfile.headerText}`}>{cardProfile.label}</span>
+                  </div>
                   <div className={`text-[10px] font-bold text-right ${cardProfile.headerText} opacity-80`}>
                     <div>{new Date(rec.date).toLocaleDateString()}</div>
-                    {endpoint === 'diet-logs' && <div className="opacity-70">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>}
                     {endpoint === 'lifestyle' && rec.endDate && <div className="opacity-70">→ {new Date(rec.endDate).toLocaleDateString()}</div>}
                   </div>
                 </div>
@@ -2734,34 +3044,22 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
                     </div>
                   )}
 
-                  {/* Timing + period badge (for doctor diet cards) */}
-                  {timingLabel && (
+                  {/* Legacy timing badge */}
+                  {timingLabel && !isMedCard && !isSuggestions && !isMandatoryFood && (
                     <div className={`inline-flex items-center gap-1.5 self-start px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider mb-3 ${cardProfile.timingBg} ${cardProfile.timingText}`}>
                       <Clock className="w-3 h-3" />
                       {timingLabel}{period && <span className="font-normal normal-case ml-0.5">· {period}</span>}
                     </div>
                   )}
 
-                  {/* Medication items (structured rows) */}
+                  {/* Medication items — each row is expandable */}
                   {hasMedItems ? (
                     <div className="space-y-2 flex-1">
                       {rec.medicationItems!.map((med, i) => (
-                        <div key={i} className="bg-white/70 rounded-xl px-3 py-2 border border-white/80 shadow-sm">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <p className="text-xs font-bold text-slate-800 leading-snug">{med.name}</p>
-                              {med.dosage && <p className="text-[10px] text-slate-500 mt-0.5">{med.dosage}</p>}
-                              {med.instructions && <p className="text-[10px] text-slate-400 italic mt-0.5">{med.instructions}</p>}
-                            </div>
-                            {med.duration && (
-                              <span className={`text-[9px] font-black px-2 py-0.5 rounded-full flex-shrink-0 ${cardProfile.timingBg} ${cardProfile.timingText} border border-current/10`}>{med.duration}</span>
-                            )}
-                          </div>
-                        </div>
+                        <MedItemRow key={i} med={med} timingBg={cardProfile.timingBg} timingText={cardProfile.timingText} />
                       ))}
                     </div>
                   ) : (
-                    /* Plain food / lifestyle description */
                     <div className="flex-1">
                       <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap line-clamp-6">{rec.description}</p>
                     </div>
@@ -2893,19 +3191,25 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
               );
             });
           })() : records.map((rec) => {
-            const isMedCard  = rec.cardType === 'PRE_MEAL_MEDICATION' || rec.cardType === 'POST_MEAL_MEDICATION';
-            const hasMedItems = (rec.medicationItems?.length ?? 0) > 0;
-            const timingLabel = rec.timing ? rec.timing.replace(/_/g, ' ') : '';
-            const periodMatch = rec.description?.match(/·\s*([^:]+):/);
-            const period = periodMatch ? periodMatch[1].trim() : '';
+            const isMedCard       = rec.cardType === 'MEDICATION' || rec.cardType === 'PRE_MEAL_MEDICATION' || rec.cardType === 'POST_MEAL_MEDICATION';
+            const hasMedItems     = (rec.medicationItems?.length ?? 0) > 0;
+            const timingLabel     = rec.timing ? rec.timing.replace(/_/g, ' ') : '';
+            const periodMatch     = rec.description?.match(/·\s*([^:]+):/);
+            const period          = periodMatch ? periodMatch[1].trim() : '';
 
-            const dotColor = rec.cardType === 'PRE_MEAL_MEDICATION' ? 'border-amber-500'
+            const dotColor = rec.cardType === 'MEDICATION'           ? 'border-indigo-500'
+                           : rec.cardType === 'SUGGESTIONS'          ? 'border-teal-500'
+                           : rec.cardType === 'MANDATORY_FOOD'       ? 'border-emerald-500'
+                           : rec.cardType === 'PRE_MEAL_MEDICATION'  ? 'border-amber-500'
                            : rec.cardType === 'POST_MEAL_MEDICATION' ? 'border-blue-500'
                            : rec.cardType === 'MEAL'                 ? 'border-emerald-500'
                            : rec.cardType === 'DIETARY_ADVICE'       ? 'border-teal-500'
                            : 'border-indigo-500';
 
-            const cardLabel = rec.cardType === 'PRE_MEAL_MEDICATION'  ? 'Pre-Meal Medication'
+            const cardLabel = rec.cardType === 'MEDICATION'           ? 'Medications'
+                            : rec.cardType === 'SUGGESTIONS'          ? 'Suggestions'
+                            : rec.cardType === 'MANDATORY_FOOD'       ? 'Mandatory Food'
+                            : rec.cardType === 'PRE_MEAL_MEDICATION'  ? 'Pre-Meal Medication'
                             : rec.cardType === 'POST_MEAL_MEDICATION' ? 'Post-Meal Medication'
                             : rec.cardType === 'MEAL'                 ? 'Meal'
                             : rec.cardType === 'DIETARY_ADVICE'       ? 'Dietary Advice'
