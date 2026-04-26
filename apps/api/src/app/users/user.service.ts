@@ -208,7 +208,9 @@ export class UserService {
   }
 
   async deleteDietLog(logId: string): Promise<any> {
-    return this.dietLogModel.findByIdAndDelete(logId).exec();
+    const deleted = await this.dietLogModel.findByIdAndDelete(logId).exec();
+    if (deleted) await this.agentService.deleteEmbedding(logId);
+    return deleted;
   }
 
   async getDietLogs(userId: string): Promise<DietLog[]> {
@@ -264,6 +266,7 @@ export class UserService {
 
   async deleteLifestyle(id: string): Promise<any> {
     const deleted = await this.lifestyleModel.findByIdAndDelete(id).exec();
+    if (deleted) await this.agentService.deleteEmbedding(id);
     const driver = this.neo4jService.getDriver();
     if (driver) {
       const session = driver.session();
@@ -276,40 +279,55 @@ export class UserService {
 
   async updateHealthEvent(eventId: string, updateData: any): Promise<HealthEvent | null> {
     const updated = await this.healthEventModel.findByIdAndUpdate(eventId, updateData, { new: true }).exec();
-    
-    // Sync update to Neo4j if title or type changed
-    const driver = this.neo4jService.getDriver();
-    if (driver && updated) {
-      const session = driver.session();
-      try {
-        await session.run(
-          `MATCH (e:HealthEvent {id: $eventId})
-           SET e.title = $title, e.type = $type, e.date = $date`,
-          {
-            eventId,
-            title: (updated.titles || []).join(', '),
-            type: updated.eventType,
-            date: updated.date.toISOString()
-          }
-        );
-      } finally {
-        await session.close();
+
+    if (updated) {
+      // Sync update to Neo4j
+      const driver = this.neo4jService.getDriver();
+      if (driver) {
+        const session = driver.session();
+        try {
+          await session.run(
+            `MATCH (e:HealthEvent {id: $eventId})
+             SET e.title = $title, e.type = $type, e.date = $date`,
+            {
+              eventId,
+              title: (updated.titles || []).join(', '),
+              type: updated.eventType,
+              date: updated.date.toISOString()
+            }
+          );
+        } finally {
+          await session.close();
+        }
       }
+
+      // Re-embed so semantic search reflects latest data
+      const eventText =
+        `${updated.eventType} on ${updated.date.toISOString().slice(0, 10)}: ` +
+        `${(updated.titles || []).join(', ')} — ${(updated as any).description || ''} (${updated.status || ''})`;
+      this.agentService.embedAndStore(
+        (updated as any).userId?.toString() ?? '',
+        eventId, 'HEALTH_EVENT', eventText, updated.date.toISOString()
+      );
     }
     return updated;
   }
 
   async deleteHealthEvent(eventId: string): Promise<any> {
     const deleted = await this.healthEventModel.findByIdAndDelete(eventId).exec();
-    
-    // Remove from Neo4j
-    const driver = this.neo4jService.getDriver();
-    if (driver) {
-      const session = driver.session();
-      try {
-        await session.run(`MATCH (e:HealthEvent {id: $eventId}) DETACH DELETE e`, { eventId });
-      } finally {
-        await session.close();
+
+    if (deleted) {
+      // Remove embedding from Neo4j vector index
+      await this.agentService.deleteEmbedding(eventId);
+      // Remove HealthEvent node from Neo4j
+      const driver = this.neo4jService.getDriver();
+      if (driver) {
+        const session = driver.session();
+        try {
+          await session.run(`MATCH (e:HealthEvent {id: $eventId}) DETACH DELETE e`, { eventId });
+        } finally {
+          await session.close();
+        }
       }
     }
     return deleted;

@@ -22,6 +22,12 @@ export class Lifestyle {
 
   @Prop({ default: 'USER' })
   source: string; // USER, DOCTOR, AI
+
+  @Prop({ index: true })
+  reportGroupId?: string;
+
+  @Prop()
+  reportLabel?: string; // e.g. "Dr. John · Apr 26 2026"
 }
 
 export const LifestyleSchema = SchemaFactory.createForClass(Lifestyle);

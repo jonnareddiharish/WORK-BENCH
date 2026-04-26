@@ -100,6 +100,8 @@ interface DietLog {
   foodItems: { name: string; quantity: string }[];
   description?: string;
   source?: string;
+  reportGroupId?: string;
+  reportLabel?: string;
 }
 
 interface LifestyleRecord {
@@ -109,6 +111,8 @@ interface LifestyleRecord {
   description: string;
   categories: string[];
   source?: string;
+  reportGroupId?: string;
+  reportLabel?: string;
 }
 
 interface MealIngredient {
@@ -1739,7 +1743,11 @@ function UserDashboard() {
                   <div key={log._id} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
                     <p className="text-xs text-slate-400 font-medium mb-0.5 flex justify-between">
                       <span>{new Date(log.date).toLocaleDateString()}</span>
-                      {log.source === 'DOCTOR' && <span className="font-black text-indigo-500 uppercase text-[9px]">Professional</span>}
+                      {log.reportLabel ? (
+                        <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 rounded-full">
+                          <Link2 className="w-2.5 h-2.5" />{log.reportLabel}
+                        </span>
+                      ) : log.source === 'DOCTOR' && <span className="font-black text-indigo-500 uppercase text-[9px]">Professional</span>}
                     </p>
                     <p className="text-sm font-semibold text-slate-800 line-clamp-2">
                       {log.description}
@@ -1782,7 +1790,11 @@ function UserDashboard() {
                   <div key={rec._id} className="p-3 border border-slate-100 rounded-xl hover:bg-slate-50 transition-colors">
                     <p className="text-xs text-slate-400 font-medium mb-0.5 flex justify-between">
                       <span>{new Date(rec.date).toLocaleDateString()}</span>
-                      {rec.source === 'DOCTOR' && <span className="font-black text-indigo-500 uppercase text-[9px]">Professional</span>}
+                      {rec.reportLabel ? (
+                        <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-1.5 py-0.5 rounded-full">
+                          <Link2 className="w-2.5 h-2.5" />{rec.reportLabel}
+                        </span>
+                      ) : rec.source === 'DOCTOR' && <span className="font-black text-indigo-500 uppercase text-[9px]">Professional</span>}
                     </p>
                     <p className="text-sm font-semibold text-slate-800 line-clamp-2">
                       {rec.description}
@@ -2125,7 +2137,23 @@ interface RecordItem {
   date: string;
   endDate?: string;
   status?: string;
+  reportLabel?: string;
+  source?: string;
 }
+
+type EditableHealthGroup = {
+  key: string;
+  evs: (RecordItem & { reportGroupId?: string; details?: HealthEvent['details']; eventType?: string; source?: string })[];
+  // editable copies
+  visitConditions: string[];
+  visitDescription: string;
+  visitStatus: string;
+  visitNotes: string;
+  medications: MedicationItem[];
+  prescriptionStatus: string;
+  testResults: TestItem[];
+  testStatus: string;
+};
 
 function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: string, endpoint: string, typeLabel: string, icon: any }) {
   const [records, setRecords] = useState<RecordItem[]>([]);
@@ -2134,6 +2162,9 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
   const [draftNote, setDraftNote] = useState<Partial<RecordItem> | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [tagInput, setTagInput] = useState('');
+  const [editingHealthGroup, setEditingHealthGroup] = useState<EditableHealthGroup | null>(null);
+  const [reanalysisResult, setReanalysisResult] = useState<{ analysis: string; profileUpdated: boolean } | null>(null);
+  const [reanalyzing, setReanalyzing] = useState(false);
   
   const location = useLocation();
   const navigate = useNavigate();
@@ -2191,6 +2222,71 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
     if (!window.confirm('Delete this record?')) return;
     const res = await fetch(`http://localhost:3000/api/users/${userId}/${endpoint}/${id}`, { method: 'DELETE' });
     if (res.ok) fetchRecords();
+  };
+
+  const openHealthGroupEdit = (key: string, evs: EditableHealthGroup['evs']) => {
+    const visitEv = evs.find(e => e.eventType === 'DOCTOR_VISIT');
+    const rxEv    = evs.find(e => e.eventType === 'PRESCRIPTION');
+    const testEv  = evs.find(e => e.eventType === 'TEST_RESULTS');
+    setReanalysisResult(null);
+    setEditingHealthGroup({
+      key, evs,
+      visitConditions:    visitEv?.details?.conditions  ?? [],
+      visitDescription:   visitEv?.description           ?? '',
+      visitStatus:        visitEv?.status                ?? 'ACTIVE',
+      visitNotes:         visitEv?.details?.notes        ?? '',
+      medications:        (rxEv?.details?.medications    ?? []) as MedicationItem[],
+      prescriptionStatus: rxEv?.status                   ?? 'ACTIVE',
+      testResults:        (testEv?.details?.testResults  ?? []) as TestItem[],
+      testStatus:         testEv?.status                 ?? 'ACTIVE',
+    });
+  };
+
+  const saveHealthGroupEdit = async () => {
+    if (!editingHealthGroup) return;
+    setReanalyzing(true);
+    const { evs, visitConditions, visitDescription, visitStatus, visitNotes,
+            medications, prescriptionStatus, testResults, testStatus } = editingHealthGroup;
+
+    const visitEv = evs.find(e => e.eventType === 'DOCTOR_VISIT');
+    const rxEv    = evs.find(e => e.eventType === 'PRESCRIPTION');
+    const testEv  = evs.find(e => e.eventType === 'TEST_RESULTS');
+
+    const updates: { ev: typeof evs[0]; body: any }[] = [];
+    if (visitEv) updates.push({ ev: visitEv, body: {
+      description: visitDescription, status: visitStatus,
+      details: { ...visitEv.details, conditions: visitConditions, notes: visitNotes },
+    }});
+    if (rxEv) updates.push({ ev: rxEv, body: {
+      status: prescriptionStatus,
+      details: { ...rxEv.details, medications },
+    }});
+    if (testEv) updates.push({ ev: testEv, body: {
+      status: testStatus,
+      details: { ...testEv.details, testResults },
+    }});
+
+    const savedEvs: any[] = [];
+    for (const { ev, body } of updates) {
+      const r = await fetch(`http://localhost:3000/api/users/${userId}/health-events/${ev._id}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (r.ok) savedEvs.push({ old: ev, new: await r.json() });
+    }
+
+    // Trigger re-analysis for the first changed event
+    if (savedEvs.length > 0) {
+      try {
+        const r = await fetch(`http://localhost:3000/api/agent/${userId}/reanalyze`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ oldEvent: savedEvs[0].old, newEvent: savedEvs[0].new }),
+        });
+        if (r.ok) setReanalysisResult(await r.json());
+      } catch (_) { /* non-fatal */ }
+    }
+
+    setReanalyzing(false);
+    fetchRecords();
   };
 
   const addTag = (val: string) => {
@@ -2427,6 +2523,9 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
                                 )}
                               </div>
                               <div className="flex gap-1">
+                                <button onClick={() => openHealthGroupEdit(key, evs)} className="p-1.5 hover:bg-indigo-50 rounded-lg text-slate-300 hover:text-indigo-500 transition-colors" title="Edit & correct this report">
+                                  <Edit3 className="w-3.5 h-3.5" />
+                                </button>
                                 {evs.map(ev => (
                                   <button key={ev._id} onClick={() => handleDelete(ev._id)} className="p-1.5 hover:bg-rose-50 rounded-lg text-slate-300 hover:text-rose-500 transition-colors" title={`Delete ${ev.eventType}`}>
                                     <Trash2 className="w-3.5 h-3.5" />
@@ -2581,6 +2680,12 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
                     {endpoint === 'diet-logs' && <div className="opacity-50">{new Date(rec.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>}
                   </div>
                 </div>
+                {rec.reportLabel && (
+                  <div className="flex items-center gap-1 mb-2">
+                    <Link2 className="w-3 h-3 text-indigo-500 flex-shrink-0" />
+                    <span className="text-[9px] font-bold text-indigo-600 bg-indigo-50/80 border border-indigo-100 px-2 py-0.5 rounded-full truncate max-w-[180px]">{rec.reportLabel}</span>
+                  </div>
+                )}
                 <div className="flex-1">
                   <p className="text-sm opacity-80 line-clamp-6 whitespace-pre-wrap">{rec.description}</p>
                 </div>
@@ -2723,6 +2828,11 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
                       <div className="flex flex-wrap gap-1">
                         <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 bg-indigo-50 px-2 py-1 rounded-lg">{rec.eventType || typeLabel}</span>
                         {tags.map(tag => <span key={tag} className="text-[9px] font-bold uppercase text-slate-500 bg-slate-100 px-2 py-1 rounded-lg">{tag}</span>)}
+                        {rec.reportLabel && (
+                          <span className="flex items-center gap-1 text-[9px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 px-2 py-0.5 rounded-full">
+                            <Link2 className="w-3 h-3" />{rec.reportLabel}
+                          </span>
+                        )}
                       </div>
                       <div className="flex gap-1">
                         <button onClick={() => { setEditingId(rec._id); setDraftNote({ ...rec, date: new Date(rec.date).toISOString() }); setViewMode('board'); }} className="p-1.5 hover:bg-slate-100 rounded-lg text-slate-400"><Edit3 className="w-3.5 h-3.5" /></button>
@@ -2735,6 +2845,149 @@ function RecordsBoard({ title, endpoint, typeLabel, icon: Icon }: { title: strin
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Health Event Group Edit Modal */}
+      {editingHealthGroup && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white rounded-t-3xl px-6 pt-6 pb-4 border-b border-slate-100 flex items-center justify-between z-10">
+              <div>
+                <h3 className="text-xl font-bold text-slate-900 flex items-center gap-2"><Edit3 className="w-5 h-5 text-indigo-500" /> Correct Report</h3>
+                <p className="text-xs text-slate-400 mt-0.5">Edits are analysed by AI to keep your health profile accurate.</p>
+              </div>
+              <button onClick={() => { setEditingHealthGroup(null); setReanalysisResult(null); }} className="p-2 hover:bg-slate-100 rounded-xl text-slate-400">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-6">
+              {/* DOCTOR_VISIT section */}
+              {editingHealthGroup.evs.some(e => e.eventType === 'DOCTOR_VISIT') && (
+                <div>
+                  <div className="flex items-center gap-2 mb-3">
+                    <Stethoscope className="w-4 h-4 text-rose-500" />
+                    <span className="text-xs font-black uppercase tracking-wider text-slate-500">Diagnoses & Visit</span>
+                  </div>
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Conditions (comma-separated)</label>
+                  <input
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-300 focus:outline-none mb-3"
+                    value={editingHealthGroup.visitConditions.join(', ')}
+                    onChange={e => setEditingHealthGroup({ ...editingHealthGroup, visitConditions: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
+                    placeholder="e.g. Hypertension, Type 2 Diabetes"
+                  />
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Visit Summary</label>
+                  <textarea
+                    rows={2}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-300 focus:outline-none resize-none mb-3"
+                    value={editingHealthGroup.visitDescription}
+                    onChange={e => setEditingHealthGroup({ ...editingHealthGroup, visitDescription: e.target.value })}
+                    placeholder="Brief visit summary..."
+                  />
+                  <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Doctor Notes</label>
+                  <textarea
+                    rows={2}
+                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-indigo-300 focus:outline-none resize-none mb-3"
+                    value={editingHealthGroup.visitNotes}
+                    onChange={e => setEditingHealthGroup({ ...editingHealthGroup, visitNotes: e.target.value })}
+                    placeholder="Doctor's notes..."
+                  />
+                  <div className="flex items-center gap-3">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Status</label>
+                    <select
+                      className="text-xs border border-slate-200 rounded-lg px-2 py-1 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                      value={editingHealthGroup.visitStatus}
+                      onChange={e => setEditingHealthGroup({ ...editingHealthGroup, visitStatus: e.target.value })}
+                    >
+                      {['ACTIVE', 'RESOLVED', 'ONGOING'].map(s => <option key={s}>{s}</option>)}
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {/* PRESCRIPTION section */}
+              {editingHealthGroup.medications.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-2 mb-3">
+                    <Pill className="w-4 h-4 text-indigo-500" />
+                    <span className="text-xs font-black uppercase tracking-wider text-slate-500">Medications</span>
+                  </div>
+                  <div className="space-y-3">
+                    {editingHealthGroup.medications.map((med, i) => (
+                      <div key={i} className="flex items-start gap-2 p-3 bg-slate-50 rounded-xl border border-slate-100">
+                        <div className="flex-1 grid grid-cols-2 gap-2">
+                          <input className="col-span-2 text-sm px-2 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" value={med.name}
+                            onChange={e => { const m = [...editingHealthGroup.medications]; m[i] = { ...m[i], name: e.target.value }; setEditingHealthGroup({ ...editingHealthGroup, medications: m }); }}
+                            placeholder="Drug name" />
+                          <input className="text-sm px-2 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" value={med.dosage}
+                            onChange={e => { const m = [...editingHealthGroup.medications]; m[i] = { ...m[i], dosage: e.target.value }; setEditingHealthGroup({ ...editingHealthGroup, medications: m }); }}
+                            placeholder="Dosage" />
+                          <input className="text-sm px-2 py-1.5 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" value={med.frequency}
+                            onChange={e => { const m = [...editingHealthGroup.medications]; m[i] = { ...m[i], frequency: e.target.value }; setEditingHealthGroup({ ...editingHealthGroup, medications: m }); }}
+                            placeholder="Frequency" />
+                        </div>
+                        <button onClick={() => { const m = editingHealthGroup.medications.filter((_, j) => j !== i); setEditingHealthGroup({ ...editingHealthGroup, medications: m }); }}
+                          className="p-1.5 hover:bg-rose-50 rounded-lg text-slate-300 hover:text-rose-500 mt-1 flex-shrink-0">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* TEST_RESULTS section */}
+              {editingHealthGroup.testResults.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-2 mb-3">
+                    <FlaskConical className="w-4 h-4 text-emerald-500" />
+                    <span className="text-xs font-black uppercase tracking-wider text-slate-500">Test Results</span>
+                  </div>
+                  <div className="space-y-2">
+                    {editingHealthGroup.testResults.map((t, i) => (
+                      <div key={i} className="flex items-center gap-2 p-2 bg-slate-50 rounded-xl border border-slate-100">
+                        <span className="text-xs font-semibold text-slate-700 w-36 flex-shrink-0 truncate">{t.testName}</span>
+                        <input className="flex-1 text-xs px-2 py-1 border border-slate-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300" value={t.value || ''}
+                          onChange={e => { const tr = [...editingHealthGroup.testResults]; tr[i] = { ...tr[i], value: e.target.value }; setEditingHealthGroup({ ...editingHealthGroup, testResults: tr }); }}
+                          placeholder="Value" />
+                        <select className="text-[10px] border border-slate-200 rounded-lg px-2 py-1 focus:outline-none" value={t.status}
+                          onChange={e => { const tr = [...editingHealthGroup.testResults]; tr[i] = { ...tr[i], status: e.target.value }; setEditingHealthGroup({ ...editingHealthGroup, testResults: tr }); }}>
+                          {['NORMAL', 'ABNORMAL', 'BORDERLINE'].map(s => <option key={s}>{s}</option>)}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* AI Analysis result */}
+              {reanalysisResult && (
+                <div className={`p-4 rounded-2xl border text-sm ${reanalysisResult.profileUpdated ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+                  <p className="text-[10px] font-black uppercase tracking-wider mb-1.5 flex items-center gap-1">
+                    <BrainCircuit className="w-3.5 h-3.5" /> AI Analysis {reanalysisResult.profileUpdated && '· Profile Updated'}
+                  </p>
+                  <p className="leading-relaxed whitespace-pre-wrap">{reanalysisResult.analysis}</p>
+                </div>
+              )}
+            </div>
+
+            <div className="sticky bottom-0 bg-white border-t border-slate-100 px-6 py-4 rounded-b-3xl flex gap-3">
+              <button
+                onClick={() => { setEditingHealthGroup(null); setReanalysisResult(null); }}
+                className="flex-1 py-2.5 text-sm font-bold text-slate-500 hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveHealthGroupEdit}
+                disabled={reanalyzing}
+                className="flex-1 py-2.5 text-sm font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-xl shadow-md disabled:opacity-50 flex items-center justify-center gap-2 transition-colors"
+              >
+                {reanalyzing ? <><RefreshCw className="w-4 h-4 animate-spin" /> Analysing...</> : <><CheckCircle2 className="w-4 h-4" /> Save & Analyse</>}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

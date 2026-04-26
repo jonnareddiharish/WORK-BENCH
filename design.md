@@ -15,6 +15,8 @@
 | No streaming | Every response blocked until the full LangGraph execution completed |
 | Single model | No way to switch providers; API credit exhaustion broke the whole agent |
 | Fragile report parsing | Medical report JSON extraction broke when models wrapped output in prose |
+| Stale embeddings | Deleted/updated records left stale vectors in Neo4j; re-analysis not triggered on edits |
+| Flat report storage | Each medical condition and medication was stored as a separate card, creating clutter |
 
 ---
 
@@ -25,6 +27,8 @@ Replace the flat-context, sequential flow with a **LangGraph graph** where:
 2. **Every agent invocation runs a semantic RAG step** that retrieves only the records relevant to the user's current message.
 3. **Token usage drops 70–85%** because the LLM sees ~1 000 targeted tokens instead of a full dump.
 4. **Multiple LLM providers** are supported with live model switching and per-model graph caching.
+5. **Medical reports produce exactly three grouped cards** (visit, prescription, tests) all linked by a shared `reportGroupId`.
+6. **Manual corrections trigger AI re-analysis** so the health profile stays accurate.
 
 ---
 
@@ -48,24 +52,18 @@ START
     │  router  │
     └────┬────┘
          │
-  ┌──────┴──────────────────┐
-  │                         │
-  ▼                         ▼
-MEDICAL_REPORT         all other intents
-  │                         │
-  ▼                         │
-parseMedicalReport          │
-  │                         │
-  ▼                         │
-storeHealthEvents           │
-  │                         │
-  ▼                         │
-storeDietLogs               │
-  │                         │
-  ▼                         │
-storeLifestyle              │
-  │                         │
-  └──────────┬──────────────┘
+  ┌──────┴────────────────────┐
+  │                           │
+  ▼                           ▼
+MEDICAL_REPORT           all other intents
+  │                           │
+  ▼                           │
+parseMedicalReport            │
+  │                           │
+  ▼                           │
+storeReportData               │
+  │                           │
+  └──────────┬────────────────┘
              ▼
    ┌──────────────────────┐
    │  synthesizeResponse  │  Chosen LLM — compact context only
@@ -88,8 +86,8 @@ Four LLM providers are supported and can be switched per message in the chat UI:
 |----|-------|----------|-----------|
 | `claude-sonnet-4-6` | Claude | Anthropic | No — requires API credits |
 | `gpt-4o-mini` | GPT-4o Mini | OpenAI | No — requires API credits |
-| `llama-3.3-70b-versatile` | Llama 3.3 | Groq | Yes — [console.groq.com](https://console.groq.com/keys) |
-| `gemini-1.5-flash` | Gemini Flash | Google | Yes — [aistudio.google.com](https://aistudio.google.com/apikey) |
+| `llama-3.3-70b-versatile` | Llama 3.3 | Groq | Yes — console.groq.com |
+| `gemini-1.5-flash` | Gemini Flash | Google | Yes — aistudio.google.com |
 
 ```typescript
 // apps/api/src/app/agent/agent.service.ts
@@ -106,45 +104,28 @@ export const AVAILABLE_MODELS = [
 Each model is instantiated once on first use and cached by model ID. A separate compiled LangGraph is also cached per model so the graph doesn't rebuild on every message.
 
 ```typescript
-// Per-model singleton caches
 private readonly _llmCache  = new Map<string, BaseChatModel>();
 private readonly _graphCache = new Map<string, any>();
 
 getLLM(modelId: string): BaseChatModel {
   if (this._llmCache.has(modelId)) return this._llmCache.get(modelId)!;
   let llm: BaseChatModel;
-
   if (modelId.startsWith('claude'))  llm = new ChatAnthropic({ model: modelId, temperature: 0 });
   else if (modelId.startsWith('gpt')) llm = new ChatOpenAI({ model: modelId, temperature: 0 });
   else if (modelId.startsWith('gemini')) {
-    // Pass key explicitly — dotenv may leave surrounding spaces
     const apiKey = (process.env.GOOGLE_API_KEY ?? '').trim();
     llm = new ChatGoogleGenerativeAI({ model: modelId, temperature: 0, apiKey, apiVersion: 'v1' } as any);
   } else {
-    // Groq: llama-*, gemma-*, mixtral-*, qwen-*, deepseek-*
-    llm = new ChatGroq({ model: modelId, temperature: 0 });
+    llm = new ChatGroq({ model: modelId, temperature: 0 }); // llama, gemma, mixtral, qwen, deepseek
   }
   this._llmCache.set(modelId, llm);
   return llm;
-}
-
-private getGraph(modelId: string): any {
-  if (!this._graphCache.has(modelId))
-    this._graphCache.set(modelId, this.buildGraph(this.getLLM(modelId)));
-  return this._graphCache.get(modelId);
 }
 ```
 
 ### Model Selector UI
 
-The chat header exposes a pill-button selector. Each pill shows a tooltip with the model's provider note. The selector is disabled while a request is in-flight.
-
-```
-[ Claude ] [ GPT-4o Mini ] [ Llama 3.3 ] [ Gemini Flash ]
-  violet      emerald         orange          blue
-```
-
-The selected model is sent in the request body for both streaming and file-upload endpoints and is echoed back in the `done` SSE event. Completed AI messages display a small model badge.
+The chat header exposes a pill-button selector. Each pill shows a tooltip with the provider note. The selector is disabled while a request is in-flight. The selected model ID is sent in the request body for both streaming and file-upload endpoints and echoed back in the `done` SSE event. Completed AI messages display a small model badge.
 
 ---
 
@@ -162,48 +143,186 @@ interface UserProfileSnapshot {
 
 interface RetrievedChunk {
   type:       string;   // 'HEALTH_EVENT' | 'DIET_LOG' | 'LIFESTYLE' | 'PROFILE' | 'MEAL_PLAN'
-  text:       string;   // pre-formatted, ready to paste into prompt
-  similarity: number;   // cosine score from Neo4j
+  text:       string;
+  similarity: number;
   date?:      string;
 }
 
+interface DoctorInfo {
+  name?: string; hospital?: string; address?: string; specialty?: string;
+}
+
+interface MedicationItem {
+  name: string; dosage: string; frequency: string; duration?: string;
+  route: string;    // ORAL | INJECTION | TOPICAL | IV | OTHER
+  isDaily: boolean; // true → tablets/tonics taken at home; false → clinic injections
+  instructions?: string;
+}
+
+interface TestItem {
+  testName: string; value?: string; referenceRange?: string;
+  interpretation?: string;
+  status: string; // NORMAL | ABNORMAL | BORDERLINE
+}
+
 interface ParsedHealthData {
-  healthEvents?: {
-    eventType:   string;       // DOCTOR_VISIT | DISEASE_DIAGNOSIS | MEDICATION | TREATMENT_START
-    titles:      string[];
+  visitDate?: string;
+  doctorInfo?: DoctorInfo;
+  // ONE card: all diagnoses from this visit
+  visitSummary?: {
     description: string;
-    status:      string;       // ACTIVE | RESOLVED | ONGOING
-    details?: {
-      doctorName?:    string;
-      medicationName?: string;
-      dosage?:        string;
-      symptoms?:      string[];
-      doctorNotes?:   string;
-    };
-  }[];
-  dietAdvice?:      { description: string; mealTypes: string[] }[];
+    conditions: string[];
+    symptoms?: string[];
+    injections?: string[];  // given at the visit, NOT for home use
+    notes?: string;
+    status: string;
+  };
+  // ONE card: all prescribed medications
+  prescriptions?: {
+    items: MedicationItem[];
+    status: string;
+  };
+  // ONE card: all test results
+  testResults?: {
+    items: TestItem[];
+    status: string;
+  };
+  dietAdvice?: { description: string; mealTypes: string[] }[];
   lifestyleAdvice?: { description: string; categories: string[] }[];
-  newConditions?:   string[];   // merged into user.medicalConditions
-  newMedications?:  string[];   // merged into user.medications
+  newConditions?: string[];
+  newMedications?: string[];
 }
 
 interface AgentState {
-  // ── inputs ──────────────────────────────────────────
   userId:              string;
   userProfile:         UserProfileSnapshot;
   message:             string;
-  conversationHistory: BaseMessage[];       // bounded to last 6 messages
-
-  // ── intermediate ─────────────────────────────────────
-  intent:          string[];          // e.g. ['MEDICAL_REPORT']
-  retrievedContext: RetrievedChunk[]; // top-8 RAG results
-  parsedData:      ParsedHealthData | null;
-  storageFeedback: string;            // human-readable "Saved 5 records…"
-
-  // ── output ───────────────────────────────────────────
-  response: string;
+  conversationHistory: BaseMessage[];
+  intent:              string[];
+  retrievedContext:    RetrievedChunk[];
+  parsedData:          ParsedHealthData | null;
+  storageFeedback:     string;
+  response:            string;
 }
 ```
+
+---
+
+## Medical Report Grouping (`reportGroupId` / `reportLabel`)
+
+When a medical report is processed, `_storeReport` generates a single UUID `reportGroupId` (via `randomUUID()` from Node.js crypto) and stamps it on **every** MongoDB document created in that run:
+
+| Document type | Fields added |
+|---------------|-------------|
+| `HealthEvent` (all 3 cards) | `reportGroupId`, `source: 'DOCTOR'` |
+| `DietLog` (daily meds + diet advice) | `reportGroupId`, `reportLabel`, `source: 'DOCTOR'` |
+| `Lifestyle` (lifestyle advice) | `reportGroupId`, `reportLabel`, `source: 'DOCTOR'` |
+
+`reportLabel` is a human-readable string derived from the doctor name and visit date — e.g. `"Dr. Smith · Apr 26 2026"`. It is stored directly on each document so diet and lifestyle records can display their origin without joins.
+
+### Three-card output per report
+
+| Card | `eventType` | Contents |
+|------|-------------|---------|
+| Visit | `DOCTOR_VISIT` | All diagnoses, symptoms, injections given at clinic, doctor notes |
+| Prescription | `PRESCRIPTION` | All medications — `MedicationItem[]` stored in `details.medications` |
+| Tests | `TEST_RESULTS` | All lab results — `TestItem[]` stored in `details.testResults` |
+
+**Daily oral medications** (where `MedicationItem.isDaily === true`) additionally create a `DietLog` entry with `mealType: ['PILLS']` so the pill schedule appears in the diet log alongside meals.
+
+**Clinic injections** appear only in `visitSummary.injections` (not in the prescription card) because they are one-off, not home-use.
+
+### Frontend grouping
+
+The RecordsBoard and UserDashboard compact panels both read `reportGroupId` to group cards visually:
+- An indigo header with doctor name, specialty, and address (MapPin icon) ties the group together.
+- DOCTOR_VISIT renders conditions as rose pills + symptoms + injections.
+- PRESCRIPTION renders a medication table with `DAILY` / `ORAL` / `INJECTION` badges.
+- TEST_RESULTS renders a test table with `NORMAL` / `ABNORMAL` / `BORDERLINE` coloured badges.
+- Diet and lifestyle cards from the same report show a `Link2` pill with the `reportLabel`.
+
+---
+
+## Edit & Re-Analysis Flow
+
+Users can correct health records returned from report parsing. The flow:
+
+1. Click the edit (pencil) button on a doctor-report group card in RecordsBoard.
+2. A modal opens showing editable fields for each sub-event:
+   - **DOCTOR_VISIT**: conditions (comma-separated), visit description, doctor notes, status.
+   - **PRESCRIPTION**: per-medication name, dosage, frequency (inline row editing, deletable).
+   - **TEST_RESULTS**: per-test value and status dropdown (`NORMAL` / `ABNORMAL` / `BORDERLINE`).
+3. On **Save & Analyse**:
+   - Each changed sub-event is `PUT` to `users/:userId/health-events/:eventId`.
+   - `user.service.ts` `updateHealthEvent` now also calls `agentService.embedAndStore` after the MongoDB update so semantic search immediately reflects the correction.
+   - `POST /api/agent/:userId/reanalyze` is called with the old and new event snapshots.
+   - The backend computes a structured diff and asks the LLM to assess clinical significance, then updates the user profile if conditions/medications changed.
+4. The AI analysis is shown inline in the modal. A **"Profile Updated"** badge indicates when `medicalConditions` or `medications` were changed.
+
+### `reanalyzeEventChanges` pipeline
+
+```
+1. _computeEventDiff(oldEvent, newEvent)
+   → identifies: conditionsAdded, conditionsRemoved,
+                 medicationsAdded, medicationsRemoved,
+                 testStatusChanges, descriptionChanged, statusChanged
+
+2. _buildDiffPrompt(diff, oldEvent, newEvent)
+   → compact bullet list of every change, asking for 2-3 sentence clinical assessment
+
+3. getLLM(modelId).invoke(systemPrompt + diffPrompt)
+   → returns analysis string
+
+4. embedAndStore(userId, newEvent._id, 'HEALTH_EVENT', eventText, date)
+   → overwrites the stale Neo4j UserHealthChunk node
+
+5. if conditionsAdded/Removed or medicationsAdded:
+   → userService.update(userId, { medicalConditions, medications })
+   → profileUpdated: true
+
+6. return { analysis, profileUpdated }
+```
+
+---
+
+## Embedding Lifecycle
+
+### Write (create)
+
+Every write path calls `embedAndStore` after the MongoDB `.save()`:
+
+| Source | Collection | Called by |
+|--------|------------|-----------|
+| Agent report store | `HealthEvent`, `DietLog`, `Lifestyle` | `_storeReport` |
+| Direct REST (user-logged) | `HealthEvent` | `user.service.addHealthEvent` |
+| Direct REST | `DietLog` | `user.service.addDietLog` |
+| Direct REST | `Lifestyle` | `user.service.addLifestyle` |
+| User profile create/update | `User` | `user.service.create` / `user.service.update` |
+
+### Update (re-embed)
+
+`user.service.updateHealthEvent` calls `agentService.embedAndStore` after the MongoDB update, ensuring the vector index always reflects the latest content. Re-analysis via `/reanalyze` also calls `embedAndStore` as part of its pipeline.
+
+### Delete (remove embedding)
+
+All three delete methods in `user.service` now call `agentService.deleteEmbedding(id)` **before** removing the MongoDB document, then also delete Neo4j structural nodes:
+
+```typescript
+// Removes the UserHealthChunk vector node from Neo4j
+async deleteEmbedding(sourceId: string): Promise<void> {
+  const session = driver.session();
+  await session.run(
+    `MATCH (c:UserHealthChunk {id: $sourceId}) DETACH DELETE c`,
+    { sourceId }
+  );
+}
+```
+
+| Method | Embedding deleted | Neo4j node deleted |
+|--------|-------------------|--------------------|
+| `deleteHealthEvent` | `UserHealthChunk {id: eventId}` | `HealthEvent {id: eventId}` |
+| `deleteDietLog` | `UserHealthChunk {id: logId}` | — |
+| `deleteLifestyle` | `UserHealthChunk {id: id}` | `Lifestyle {id: id}` |
 
 ---
 
@@ -213,15 +332,14 @@ Every piece of user health data becomes a `UserHealthChunk` node. Embeddings are
 
 ```cypher
 (:UserHealthChunk {
-  id:        string,    -- MongoDB _id of the source document
+  id:        string,    -- MongoDB _id of the source document (primary key)
   userId:    string,
-  chunkType: string,    -- 'HEALTH_EVENT' | 'DIET_LOG' | 'LIFESTYLE' | 'PROFILE' | 'MEAL_PLAN'
-  text:      string,    -- the text that was embedded
-  date:      string,    -- ISO date for time-aware retrieval
-  embedding: float[]    -- 384-dim vector (all-MiniLM-L6-v2)
+  chunkType: string,    -- 'HEALTH_EVENT' | 'DIET_LOG' | 'LIFESTYLE' | 'PROFILE'
+  text:      string,
+  date:      string,
+  embedding: float[]    -- 384-dim cosine vector
 })
 
--- Vector index (created once at AgentService startup)
 CREATE VECTOR INDEX userHealthChunks IF NOT EXISTS
 FOR (c:UserHealthChunk) ON c.embedding
 OPTIONS { indexConfig: { `vector.dimensions`: 384, `vector.similarity_function`: 'cosine' } }
@@ -231,19 +349,19 @@ CALL db.index.vector.queryNodes('userHealthChunks', 20, $queryVector)
 YIELD node AS c, score
 WHERE c.userId = $userId
 RETURN c.chunkType, c.text, c.date, score
-ORDER BY score DESC
-LIMIT 8
+ORDER BY score DESC LIMIT 8
 ```
 
-### Text templates for each chunk type
+`MERGE … SET` semantics mean an `embedAndStore` call on an existing `id` **updates** the node in-place — idempotent, no duplicate chunks.
+
+### Text templates
 
 | Type | Embedded text |
 |------|---------------|
 | `HEALTH_EVENT` | `"{eventType} on {date}: {titles.join(', ')} — {description} ({status})"` |
-| `DIET_LOG` | `"Meal on {date} ({mealType}): {foodItems.map(i => i.name + ' ' + i.quantity).join(', ')}"` |
-| `LIFESTYLE` | `"Lifestyle on {date} [{categories.join('/')}]: {description}"` |
+| `DIET_LOG` | `"(Doctor diet advice \| Meal) on {date}: {description}"` |
+| `LIFESTYLE` | `"(Doctor lifestyle advice \| Lifestyle) on {date} [{categories}]: {description}"` |
 | `PROFILE` | `"Patient {name}: conditions [{conditions}], allergies [{allergies}], medications [{meds}]"` |
-| `MEAL_PLAN` | `"Meal plan day {dayNumber}: {meals.map(m => m.mealType + ': ' + m.title).join('; ')}"` |
 
 ---
 
@@ -251,278 +369,155 @@ LIMIT 8
 
 ### 1. `classifyIntent`
 
-**Input used**: `message` only  
-**Tokens**: ~200 (system + message)
-
-```typescript
-private async _classifyIntent(message: string, llm: BaseChatModel): Promise<string[]> {
-  const res = await llm.invoke([
-    new SystemMessage(
-      'Classify the user message into one or more of: HEALTH_RECORD, DIET_LOG, LIFESTYLE_LOG, ' +
-      'MEDICAL_REPORT, MEAL_PLAN, QUERY, OTHER. ' +
-      'MEDICAL_REPORT means the message IS a medical report/lab result/doctor notes to be parsed and stored. ' +
-      'Return ONLY comma-separated labels, nothing else.'
-    ),
-    new HumanMessage(message),
-  ]);
-  return (res.content as string).split(',').map(s => s.trim().toUpperCase());
-}
-```
-
----
+Fast 1-call classification using only the user's message (~200 tokens). Returns comma-separated labels: `HEALTH_RECORD`, `DIET_LOG`, `LIFESTYLE_LOG`, `MEDICAL_REPORT`, `MEAL_PLAN`, `QUERY`, `OTHER`.
 
 ### 2. `retrieveContext`
 
-**Input used**: `message`, `userId`  
-**Tokens added to downstream nodes**: ~600 (8 chunks × ~75 tokens each)
+Embeds the user message locally → Neo4j vector search scoped to `userId` → returns top-8 chunks (~600 tokens added downstream).
 
-Embeds the user's message locally, runs a Neo4j vector search scoped to the user, and returns the top-8 most relevant health records.
-
----
-
-### 3. Router (conditional edge)
+### 3. Router
 
 ```typescript
 const routeByIntent = (state: AgentState): string =>
   state.intent?.includes('MEDICAL_REPORT') ? 'parseMedicalReport' : 'synthesizeResponse';
 ```
 
-All non-MEDICAL_REPORT intents (HEALTH_RECORD, DIET_LOG, LIFESTYLE_LOG, MEAL_PLAN, QUERY) route directly to `synthesizeResponse` with the retrieved context injected.
-
----
-
 ### 4. `parseMedicalReport`
 
-Extracts ALL structured data from a medical document. The extraction prompt is explicit about every event type to produce to avoid omissions, and the result is parsed with `_extractJson` which is resilient to models that wrap JSON output in prose or markdown fences.
+Extracts ALL structured data from a medical document into the `ParsedHealthData` shape. The system prompt enforces:
+- Every condition goes in `visitSummary.conditions[]` (not individual cards).
+- Clinic injections go in `visitSummary.injections[]`, never in `prescriptions`.
+- `isDaily: true` for tablets/tonics taken at home; `false` for clinic-only injections.
+- `prescriptions.items[]` contains only home-use medications.
 
-```typescript
-private async _parseMedicalReport(message: string, llm: BaseChatModel): Promise<ParsedHealthData> {
-  const systemPrompt =
-    'You are a medical data extraction system. Extract ALL information from the medical report.\n' +
-    'Return ONLY a valid JSON object — no prose, no markdown fences, nothing else.\n\n' +
-    'Required JSON shape:\n' +
-    '{\n' +
-    '  "healthEvents": [\n' +
-    '    One DOCTOR_VISIT event for the consultation: { "eventType": "DOCTOR_VISIT", ... },\n' +
-    '    One DISEASE_DIAGNOSIS event PER diagnosis/finding: { "eventType": "DISEASE_DIAGNOSIS", ... },\n' +
-    '    One MEDICATION event PER prescribed medication: { "eventType": "MEDICATION", ... }\n' +
-    '  ],\n' +
-    '  "dietAdvice": [...],\n' +
-    '  "lifestyleAdvice": [...],\n' +
-    '  "newConditions": ["each diagnosis as a plain string"],\n' +
-    '  "newMedications": ["each medication with dosage as a plain string"]\n' +
-    '}';
-  // ...
-}
-```
-
-**Robust JSON extraction** — `_extractJson` strips markdown fences first, then finds the outermost `{…}` bounds in the response. This handles Llama 3.3 and other models that prefix or suffix the JSON with explanatory prose:
+**`_extractJson`** — strips markdown fences and finds the outermost `{…}` bounds, making extraction resilient to models that wrap JSON in prose:
 
 ```typescript
 private _extractJson(text: string): any {
   let s = text
     .replace(/^```json\s*/im, '').replace(/^```\s*/im, '').replace(/\s*```\s*$/m, '').trim();
-  const start = s.indexOf('{');
-  const end   = s.lastIndexOf('}');
+  const start = s.indexOf('{'); const end = s.lastIndexOf('}');
   if (start !== -1 && end > start) s = s.slice(start, end + 1);
   return JSON.parse(s);
 }
 ```
 
----
+### 5. `storeReportData`
 
-### 5. Storage nodes (`storeHealthEvents`, `storeDietLogs`, `storeLifestyle`)
-
-Each node writes parsed data to MongoDB, then calls `embedAndStore` to index the text in Neo4j.
-
-**Supported health event types** (polymorphic `HealthEvent` collection):
-
-| `eventType` | What it captures |
-|-------------|-----------------|
-| `DOCTOR_VISIT` | Consultation record with `doctorName` and `doctorNotes` in `details` |
-| `DISEASE_DIAGNOSIS` | A diagnosis or clinical finding |
-| `MEDICATION` | A prescribed drug with `medicationName` and `dosage` in `details` |
-| `TREATMENT_START` | A procedure or treatment beginning |
-
-The final `storeLifestyle` node also **merges new conditions and medications into the user's profile**:
+Single graph node that delegates to `_storeReport`. Replaced the old three-node sequence (`storeHealthEvents → storeDietLogs → storeLifestyle`):
 
 ```typescript
-// De-duplicate and merge into user.medicalConditions and user.medications
-await this.userService.update(state.userId, {
-  medicalConditions: Array.from(new Set([...currentUser.medicalConditions, ...newConditions])),
-  medications:       Array.from(new Set([...currentUser.medications,       ...newMedications])),
-});
+const storeReportData = async (state: AgentState): Promise<Partial<AgentState>> => {
+  if (!state.parsedData) return {};
+  const feedback = await this._storeReport(state.userId, state.parsedData);
+  return feedback ? { storageFeedback: feedback } : {};
+};
 ```
 
----
+### `_storeReport()` — full pipeline
+
+```
+1. Generate reportGroupId = randomUUID()
+   Build reportLabel = "Dr. {name} · {date}" (or just date if no doctor info)
+
+2. If parsedData.visitSummary:
+   → Save ONE HealthEvent { eventType: 'DOCTOR_VISIT', details: { doctorInfo, conditions, symptoms, injections, notes }, reportGroupId }
+   → embedAndStore(userId, id, 'HEALTH_EVENT', text, date)
+
+3. If parsedData.prescriptions.items.length > 0:
+   → Save ONE HealthEvent { eventType: 'PRESCRIPTION', details: { doctorInfo, medications: MedicationItem[] }, reportGroupId }
+   → embedAndStore(userId, id, 'HEALTH_EVENT', text, date)
+   → For each medication where isDaily === true:
+       Save DietLog { mealTypes: ['PILLS'], description: '{name} {dosage} — {frequency}', reportGroupId, reportLabel }
+
+4. If parsedData.testResults.items.length > 0:
+   → Save ONE HealthEvent { eventType: 'TEST_RESULTS', details: { testResults: TestItem[] }, reportGroupId }
+   → embedAndStore(userId, id, 'HEALTH_EVENT', text, date)
+
+5. For each dietAdvice item:
+   → Save DietLog { reportGroupId, reportLabel, source: 'DOCTOR' }
+   → embedAndStore(userId, id, 'DIET_LOG', text, date)
+
+6. For each lifestyleAdvice item:
+   → Save Lifestyle { reportGroupId, reportLabel, source: 'DOCTOR' }
+   → embedAndStore(userId, id, 'LIFESTYLE', text, date)
+
+7. Merge newConditions + newMedications into user profile (Set-based dedup)
+
+8. Return human-readable feedback: "3 health record cards saved, 2 daily meds added to diet, 1 condition added to profile."
+```
 
 ### 6. `synthesizeResponse`
 
-**Token budget** (target < 1 200 tokens total):
+**Token budget** (target < 1 200 tokens):
 
-| Slot | Content | Tokens |
-|------|---------|--------|
-| System prompt | Role + instructions | ~150 |
-| Static profile | name, allergies, conditions, meds | ~100 |
-| Retrieved context | 8 chunks × ~75 tokens | ~600 |
-| Conversation history | Last 3 exchanges (6 messages bounded) | ~250 |
-| Current message | User input | ~100 |
-| **Total** | | **~1 200** |
-
-When a medical report was just stored, the `storageFeedback` string is appended to the user message so the LLM knows what was saved and can acknowledge it naturally.
-
----
-
-## Embedding Indexing Pipeline
-
-### At startup (AgentService constructor)
-Check if Neo4j vector index `userHealthChunks` exists; create it if not.
-
-### At write-time (via agent)
-Every agent write calls `embedAndStore` after the MongoDB `.save()`:
-
-| Node | Collection written | Chunk type |
-|------|--------------------|------------|
-| `storeHealthEvents` | `HealthEvent` | `HEALTH_EVENT` |
-| `storeDietLogs` | `DietLog` | `DIET_LOG` |
-| `storeLifestyle` | `Lifestyle` | `LIFESTYLE` |
-
-> _(Planned)_ Write-time embed hooks in the domain services (`HealthEventService`, `DietLogService`, `LifestyleService`, `UserService`) — records written directly via REST (not through the agent) are not yet indexed.
+| Slot | ~Tokens |
+|------|---------|
+| System prompt (role + instructions) | 150 |
+| Static profile | 100 |
+| Retrieved context (8 chunks) | 600 |
+| Conversation history (last 6 messages) | 250 |
+| Current message | 100 |
+| **Total** | **~1 200** |
 
 ---
 
 ## Streaming Chat (SSE)
 
-### Overview
+### Endpoints
 
-Two response modes:
-
-| Mode | Endpoint | When used |
-|------|----------|-----------|
-| **Blocking** | `POST /agent/:userId/chat` | Internal / batch use |
-| **Streaming** | `POST /agent/:userId/chat/stream` | All text messages from the UI |
-| **File upload** | `POST /agent/:userId/chat-with-file` | PDF / image medical documents |
+| Method | Path | Notes |
+|--------|------|-------|
+| `POST` | `/api/agent/:userId/chat` | Blocking — returns `{ reply, intent, retrievedCount, stored, model }` |
+| `POST` | `/api/agent/:userId/chat/stream` | SSE stream (POST + text/event-stream) |
+| `POST` | `/api/agent/:userId/chat-with-file` | `multipart/form-data`; PDF/image → text extraction → blocking chat |
 
 ### Why POST for SSE?
 
-Browser `EventSource` only supports GET. Because we need to send a JSON body (message + history + model), the streaming endpoint is a `POST` that returns `Content-Type: text/event-stream`. The frontend consumes it via `fetch` + `ReadableStream`.
+Browser `EventSource` only supports GET. Because a JSON body is needed (message + history + model), the streaming endpoint is a POST returning `Content-Type: text/event-stream`, consumed by the frontend via `fetch + ReadableStream`.
 
 ### SSE Event Protocol
 
-Each event follows standard SSE wire format (`event: <type>\ndata: <json>\n\n`):
-
 | Event | Payload | When emitted |
 |-------|---------|--------------|
-| `node` | `{ label: string }` | Before and after each pipeline step |
-| `intent` | `{ intent: string[] }` | After classify step resolves |
-| `token` | `{ token: string }` | Each streamed chunk from `llm.stream()` |
-| `done` | `{ intent, retrievedCount, stored, model }` | After all tokens sent |
-| `error` | `{ message: string }` | On unhandled exception |
+| `node` | `{ label: string }` | Before/after each pipeline step |
+| `intent` | `{ intent: string[] }` | After classify step |
+| `token` | `{ token: string }` | Each streamed LLM chunk |
+| `done` | `{ intent, retrievedCount, stored, model }` | After all tokens |
+| `error` | `{ message: string }` | On exception |
 
-### Backend: `chatStream()` Pipeline
-
-`AgentService.chatStream()` runs the pipeline directly (bypassing the compiled LangGraph) so it can emit events between steps and stream individual tokens:
+### `chatStream()` Pipeline Steps
 
 ```
 1. sendEvent('node', 'Classifying intent...')
-   → _classifyIntent(message, llm)           [~200 tokens]
-   → sendEvent('intent', { intent })
+   _classifyIntent(message, llm)  →  sendEvent('intent', { intent })
 
 2. sendEvent('node', 'Searching health history...')
-   → _retrieveContext(userId, message)       [embed → Neo4j]
-   → sendEvent('node', `Found N relevant records`)
+   _retrieveContext(userId, message)  →  sendEvent('node', 'Found N relevant records')
 
 3. if MEDICAL_REPORT in intent:
-     sendEvent('node', 'Parsing medical report...')
-     → _parseMedicalReport(message, llm)    [LLM → _extractJson → ParsedHealthData]
-     sendEvent('node', 'Saving records to your profile...')
-     → _storeReport(userId, parsedData)     [MongoDB writes + embed + profile merge]
-     → sendEvent('node', storageFeedback)
+   sendEvent('node', 'Parsing medical report...')
+   _parseMedicalReport(message, llm)
+   sendEvent('node', 'Saving records to your profile...')
+   _storeReport(userId, parsedData)  →  sendEvent('node', storageFeedback)
 
 4. sendEvent('node', 'Generating response...')
-   → llm.stream([systemPrompt, ...history, userMsg])
-   → for each chunk: sendEvent('token', { token })
+   llm.stream([systemPrompt, ...history, userMsg])
+   for each chunk: sendEvent('token', { token })
 
 5. sendEvent('done', { intent, retrievedCount, stored, model })
 ```
 
-### `_storeReport()` (streaming path)
+### Frontend SSE Consumer
 
-The streaming path uses `_storeReport` rather than the individual graph store nodes. It handles all three save operations plus the user profile merge in one method:
-
-```
-_storeReport(userId, parsedData):
-  1. Save all healthEvents (DOCTOR_VISIT, DISEASE_DIAGNOSIS, MEDICATION) → embed each
-  2. Save all dietAdvice → embed each
-  3. Save all lifestyleAdvice → embed each
-  4. Merge newConditions + newMedications into user profile (Set-based dedup)
-  5. Return human-readable feedback string
-```
-
-### Private Helper Methods
-
-| Method | Parameters | Used by |
-|--------|-----------|---------|
-| `_classifyIntent` | `message, llm` | graph node + `chatStream` |
-| `_retrieveContext` | `userId, message` | graph node + `chatStream` |
-| `_parseMedicalReport` | `message, llm` | graph node + `chatStream` |
-| `_extractJson` | `text` | `_parseMedicalReport` |
-| `_storeReport` | `userId, parsedData` | `chatStream` only |
-| `_buildProfileText` | `userProfile` | graph node + `chatStream` |
-| `_chunkText` | `content` | `chatStream` token loop |
-
-**`_chunkText`** handles the two content formats that different providers emit:
-- Anthropic: `content` is an `Array<{type:'text', text:string}>`
-- OpenAI/Groq/Gemini: `content` is a plain `string`
-
-### Frontend: SSE Consumer
-
-`handleSendMessage` in `app.tsx` opens the stream via `fetch + ReadableStream`:
-
-```typescript
-const res = await fetch(`/api/agent/${userId}/chat/stream`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ message, history, model: selectedModel }),
-});
-const reader = res.body!.getReader();
-// Buffer bytes, split on '\n\n' for complete SSE frames,
-// parse event + data, update React state incrementally.
-```
-
-**State updates per event:**
+`handleSendMessage` opens the stream via `fetch + ReadableStream`, buffers bytes, splits on `\n\n` for complete SSE frames, and updates React state incrementally:
 
 | Event | React state change |
 |-------|-------------------|
-| `node` | Updates `streamingStep` on the placeholder bubble (animated pill) |
-| `token` | Appends to `content` of the placeholder (blinking cursor) |
-| `done` | Sets `isStreaming: false`, attaches intent/retrieved-count/model fields |
-| `error` | Replaces placeholder content with error text |
-
-### Chat Message Type
-
-```typescript
-{
-  role:           'user' | 'ai';
-  content:        string;
-  intent?:        string[];
-  retrievedCount?: number;
-  model?:         string;            // model ID echoed from 'done' event
-  attachedFile?:  { name: string; type: string; preview?: string };
-  isStreaming?:   boolean;           // true while SSE stream is open
-  streamingStep?: string;            // label of the current pipeline step
-}
-```
-
-### UI Behaviour During Streaming
-
-1. User sends message → user bubble appears immediately, input field clears.
-2. Empty AI placeholder added with `isStreaming: true`, `streamingStep: 'Starting...'`.
-3. `node` events update the animated bouncing-dot pill with the current step label.
-4. First `token` event causes the bubble content to appear; cursor blinks at the end.
-5. Subsequent tokens append in-place — smooth typewriter effect, no re-mount.
-6. `done` event removes streaming indicators and shows intent/retrieved-count pills and model badge.
-7. `chatEndRef` scroll effect fires on every `chatHistory` update → always scrolled to bottom.
+| `node` | Updates `streamingStep` label on the placeholder bubble |
+| `token` | Appends to `content` (blinking cursor effect) |
+| `done` | Clears streaming flag, attaches intent/retrieved-count/model badge |
+| `error` | Replaces placeholder with error text |
 
 ---
 
@@ -531,35 +526,32 @@ const reader = res.body!.getReader();
 | Method | Path | Body | Notes |
 |--------|------|------|-------|
 | `GET` | `/api/agent/models` | — | Returns `AVAILABLE_MODELS` array |
-| `POST` | `/api/agent/:userId/chat` | `{ message, history, model? }` | Blocking; returns `{ reply, intent, retrievedCount, stored, model }` |
+| `POST` | `/api/agent/:userId/chat` | `{ message, history, model? }` | Blocking chat |
 | `POST` | `/api/agent/:userId/chat/stream` | `{ message, history, model? }` | SSE stream |
-| `POST` | `/api/agent/:userId/chat-with-file` | `multipart/form-data` `file` + `message?` + `model?` | PDF/image → text extraction → blocking chat |
+| `POST` | `/api/agent/:userId/chat-with-file` | `multipart/form-data` | PDF/image → text → chat |
+| `POST` | `/api/agent/:userId/reanalyze` | `{ oldEvent, newEvent, model? }` | Diff → LLM analysis → re-embed → profile update |
 
 ---
 
 ## Environment Variables
 
 ```env
-# Required
 MONGODB_URI=mongodb://localhost:27017/workbench
 PORT=3000
 NODE_ENV=development
 API_PREFIX=/api
 
-# LLM providers — add the keys for providers you want to use
-ANTHROPIC_API_KEY=   # Claude Sonnet 4.6 — console.anthropic.com (requires paid credits)
-OPENAI_API_KEY=      # GPT-4o Mini — platform.openai.com/api-keys
-GROQ_API_KEY=        # Llama 3.3 70B (free tier) — console.groq.com/keys
-GOOGLE_API_KEY=      # Gemini 1.5 Flash (free tier) — aistudio.google.com/apikey
+ANTHROPIC_API_KEY=   # Claude Sonnet 4.6
+OPENAI_API_KEY=      # GPT-4o Mini
+GROQ_API_KEY=        # Llama 3.3 70B (free tier) — console.groq.com
+GOOGLE_API_KEY=      # Gemini 1.5 Flash (free tier) — aistudio.google.com
 
-# Neo4j (optional — graph features + semantic search)
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=
 ```
 
-> **Embeddings** run locally via HuggingFace `Xenova/all-MiniLM-L6-v2` — no API key required.  
-> The agent gracefully falls back: if a model key is missing it returns a provider error; other models in the selector still work.
+> **Embeddings** run locally via `Xenova/all-MiniLM-L6-v2` — no API key required.
 
 ---
 
@@ -569,10 +561,8 @@ NEO4J_PASSWORD=
 |----------|-----------------|----------------|--------|
 | Simple health Q&A | 800 – 1 500 | ~900 | ~40% |
 | Query with full history (50 records) | 4 000 – 6 000 | ~1 200 | ~75% |
-| Medical report parsing + store | 3 000 – 5 000 | ~1 800* | ~55% |
+| Medical report parsing + store | 3 000 – 5 000 | ~1 800 | ~55% |
 | Meal plan generation | 2 000 – 4 000 | ~1 500 | ~55% |
-
-\* Parsing node receives message only (~500 tokens); synthesize node receives RAG context (~700 tokens). Two separate LLM calls but both smaller than the old single call.
 
 ---
 
@@ -580,28 +570,26 @@ NEO4J_PASSWORD=
 
 | File | Status | Notes |
 |------|--------|-------|
-| `apps/api/src/app/agent/agent.service.ts` | ✅ Done | LangGraph graph + multi-model cache + private helpers + `chat()` + `chatStream()` + `_extractJson` + `_storeReport` |
-| `apps/api/src/app/agent/agent.controller.ts` | ✅ Done | `GET /models`, blocking `POST /chat`, streaming `POST /chat/stream`, `POST /chat-with-file` (all accept `model?`) |
-| `apps/ui/src/app/app.tsx` | ✅ Done | Model selector pills, SSE consumer, streaming state, reasoning step pills, model badge, auto-scroll |
-| `apps/api/src/app/health-events/health-event.schema.ts` | ✅ Done | Supports DOCTOR_VISIT / DISEASE_DIAGNOSIS / MEDICATION / TREATMENT_START + `details` object |
+| `apps/api/src/app/agent/agent.service.ts` | ✅ Done | LangGraph graph · multi-model cache · `_storeReport` (3-card grouping + `reportGroupId`/`reportLabel`) · `deleteEmbedding` · `reanalyzeEventChanges` · `_computeEventDiff` · `_buildDiffPrompt` |
+| `apps/api/src/app/agent/agent.controller.ts` | ✅ Done | `GET /models` · `POST /chat` · `POST /chat/stream` · `POST /chat-with-file` · `POST /reanalyze` |
+| `apps/api/src/app/users/user.service.ts` | ✅ Done | All write paths call `embedAndStore` · `updateHealthEvent` re-embeds · `deleteHealthEvent`/`deleteDietLog`/`deleteLifestyle` call `deleteEmbedding` |
+| `apps/api/src/app/health-events/health-event.schema.ts` | ✅ Done | `reportGroupId` (indexed) · rich `details` object (doctorInfo / conditions / medications / testResults) |
+| `apps/api/src/app/diet-logs/diet-log.schema.ts` | ✅ Done | `reportGroupId` (indexed) · `reportLabel` |
+| `apps/api/src/app/lifestyle/lifestyle.schema.ts` | ✅ Done | `reportGroupId` (indexed) · `reportLabel` |
+| `apps/ui/src/app/app.tsx` | ✅ Done | 3-card grouped display · edit modal with AI re-analysis · `reportLabel` pills on diet/lifestyle cards (compact panels + RecordsBoard board + timeline) |
 | `apps/api/src/app/neo4j/neo4j.service.ts` | ✅ Done | `ensureVectorIndex()` runs at startup |
 | `apps/api/.env.example` | ✅ Done | Documents all 4 LLM keys with source URLs |
-| `.gitignore` | ✅ Done | Protects `.env` files, `node_modules`, `dist`, `.nx/cache`, HuggingFace `.cache/` |
-| `apps/api/src/app/agent/agent.state.ts` | _(planned)_ | Interfaces currently defined inline in `agent.service.ts` |
+| `.gitignore` | ✅ Done | Protects `.env`, `node_modules`, `dist`, `.nx/cache`, HuggingFace `.cache/` |
+| `apps/api/src/app/agent/agent.state.ts` | _(planned)_ | Interfaces currently inline in `agent.service.ts` |
 | `apps/api/src/app/agent/agent.graph.ts` | _(planned)_ | Graph currently built inside `AgentService.buildGraph()` |
-| `apps/api/src/app/agent/agent.nodes.ts` | _(planned)_ | Nodes currently as private methods on `AgentService` |
-| `apps/api/src/app/users/user.service.ts` | _(planned)_ | `embedAndStore` on profile update not yet wired |
-| `apps/api/src/app/health-events/health-event.service.ts` | _(planned)_ | `embedAndStore` called from agent graph, not from the service directly |
-| `apps/api/src/app/diet-logs/diet-log.service.ts` | _(planned)_ | Same — embed happens only through agent |
-| `apps/api/src/app/lifestyle/lifestyle.service.ts` | _(planned)_ | Same |
 | `apps/api/src/app/meal-plans/meal-plan.service.ts` | _(planned)_ | Meal plan chunks not yet embedded |
 
 ---
 
 ## Remaining Work (Planned)
 
-1. **Write-time embed hooks** — wire `embedAndStore` into each domain service so records written directly via REST (not through the agent) are also indexed in Neo4j.
-2. **Backfill script** — one-shot script to embed pre-existing MongoDB records for users who created data before the agent was introduced.
-3. **Multi-branch router** — extend the conditional edge to route `HEALTH_RECORD`, `DIET_LOG`, and `LIFESTYLE_LOG` intents to dedicated store nodes (currently all non-MEDICAL_REPORT paths go straight to `synthesizeResponse`).
-4. **File upload streaming** — `chat-with-file` currently blocks; could begin streaming after file extraction completes.
-5. **Module extraction** — move `AgentState`, graph factory, and node functions into separate files (`agent.state.ts`, `agent.graph.ts`, `agent.nodes.ts`) for maintainability.
+1. **Backfill script** — one-shot script to embed pre-existing MongoDB records created before the agent was introduced.
+2. **Multi-branch router** — extend the conditional edge to route `HEALTH_RECORD`, `DIET_LOG`, and `LIFESTYLE_LOG` intents to dedicated store nodes.
+3. **File upload streaming** — `chat-with-file` currently blocks; streaming could begin after extraction completes.
+4. **Module extraction** — move `AgentState`, graph factory, and node functions into `agent.state.ts` / `agent.graph.ts` / `agent.nodes.ts`.
+5. **Reanalyze for all sub-events** — current `/reanalyze` endpoint runs diff on the first changed sub-event only; extend to diff all three cards and aggregate the analysis.

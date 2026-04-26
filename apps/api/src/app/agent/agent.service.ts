@@ -213,7 +213,23 @@ export class AgentService {
     }
   }
 
-  // ── Public embedding utility ───────────────────────────────────────────────
+  // ── Public embedding utilities ─────────────────────────────────────────────
+
+  async deleteEmbedding(sourceId: string): Promise<void> {
+    const driver = this.neo4jService.getDriver();
+    if (!driver) return;
+    const session = driver.session();
+    try {
+      await session.run(
+        `MATCH (c:UserHealthChunk {id: $sourceId}) DETACH DELETE c`,
+        { sourceId }
+      );
+    } catch (err: any) {
+      this.logger.warn(`deleteEmbedding failed [${sourceId}]: ${err.message}`);
+    } finally {
+      await session.close();
+    }
+  }
 
   async embedAndStore(
     userId: string,
@@ -371,6 +387,10 @@ export class AgentService {
   private async _storeReport(userId: string, parsedData: ParsedHealthData): Promise<string> {
     const today = new Date();
     const reportGroupId = randomUUID();
+    const doctorName = parsedData.doctorInfo?.name;
+    const dateStr = (parsedData.visitDate ? new Date(parsedData.visitDate) : today)
+      .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const reportLabel = doctorName ? `${doctorName} · ${dateStr}` : dateStr;
     let savedCards = 0;
     const dailyMedNames: string[] = [];
 
@@ -440,6 +460,7 @@ export class AgentService {
             (med.instructions ? ` (${med.instructions})` : '');
           await new this.dietLogModel({
             userId, description: desc, mealTypes: ['PILLS'], source: 'DOCTOR', date: today,
+            reportGroupId, reportLabel,
           }).save();
           dailyMedNames.push(med.name);
         } catch (err: any) {
@@ -477,7 +498,7 @@ export class AgentService {
       try {
         const doc = await new this.dietLogModel({
           userId, description: diet.description, mealTypes: diet.mealTypes || [],
-          source: 'DOCTOR', date: today,
+          source: 'DOCTOR', date: today, reportGroupId, reportLabel,
         }).save();
         await this.embedAndStore(
           userId, doc._id.toString(), 'DIET_LOG',
@@ -494,7 +515,7 @@ export class AgentService {
       try {
         const doc = await new this.lifestyleModel({
           userId, description: ls.description, categories: ls.categories || [],
-          source: 'DOCTOR', date: today,
+          source: 'DOCTOR', date: today, reportGroupId, reportLabel,
         }).save();
         await this.embedAndStore(
           userId, doc._id.toString(), 'LIFESTYLE',
@@ -529,6 +550,117 @@ export class AgentService {
     if (newConditions.length)  parts.push(`${newConditions.length} condition${newConditions.length > 1 ? 's' : ''} added to profile`);
     if (newMedications.length) parts.push(`${newMedications.length} medication${newMedications.length > 1 ? 's' : ''} added to profile`);
     return parts.join(', ') + '.';
+  }
+
+  // ── Re-analysis after manual edit ─────────────────────────────────────────
+
+  private _computeEventDiff(oldEvent: any, newEvent: any) {
+    const oldConditions: string[] = oldEvent.details?.conditions ?? [];
+    const newConditions: string[] = newEvent.details?.conditions ?? [];
+    const conditionsAdded   = newConditions.filter(c => !oldConditions.includes(c));
+    const conditionsRemoved = oldConditions.filter(c => !newConditions.includes(c));
+
+    const oldMedNames: string[] = (oldEvent.details?.medications ?? []).map((m: any) => m.name);
+    const newMedNames: string[] = (newEvent.details?.medications ?? []).map((m: any) => m.name);
+    const medicationsAdded   = newMedNames.filter(m => !oldMedNames.includes(m));
+    const medicationsRemoved = oldMedNames.filter(m => !newMedNames.includes(m));
+
+    const oldTests: any[] = oldEvent.details?.testResults ?? [];
+    const newTests: any[] = newEvent.details?.testResults ?? [];
+    const statusChanges = newTests
+      .filter(nt => {
+        const ot = oldTests.find(t => t.testName === nt.testName);
+        return ot && ot.status !== nt.status;
+      })
+      .map(nt => {
+        const ot = oldTests.find(t => t.testName === nt.testName);
+        return `${nt.testName}: ${ot.status} → ${nt.status}`;
+      });
+
+    const descriptionChanged = (oldEvent.description ?? '') !== (newEvent.description ?? '');
+    const statusChanged      = (oldEvent.status ?? '') !== (newEvent.status ?? '');
+
+    const hasChanges =
+      conditionsAdded.length > 0 || conditionsRemoved.length > 0 ||
+      medicationsAdded.length > 0 || medicationsRemoved.length > 0 ||
+      statusChanges.length > 0 || descriptionChanged || statusChanged;
+
+    return {
+      hasChanges, conditionsAdded, conditionsRemoved,
+      medicationsAdded, medicationsRemoved, statusChanges,
+      descriptionChanged, statusChanged,
+    };
+  }
+
+  private _buildDiffPrompt(diff: ReturnType<AgentService['_computeEventDiff']>, oldEvent: any, newEvent: any): string {
+    const lines = [
+      `Health record type: ${newEvent.eventType}`,
+      `Record date: ${new Date(newEvent.date).toISOString().slice(0, 10)}`,
+      '',
+      'Manual corrections made:',
+    ];
+    if (diff.conditionsAdded.length)   lines.push(`- CONDITIONS ADDED: ${diff.conditionsAdded.join(', ')}`);
+    if (diff.conditionsRemoved.length) lines.push(`- CONDITIONS REMOVED: ${diff.conditionsRemoved.join(', ')}`);
+    if (diff.medicationsAdded.length)  lines.push(`- MEDICATIONS ADDED: ${diff.medicationsAdded.join(', ')}`);
+    if (diff.medicationsRemoved.length)lines.push(`- MEDICATIONS REMOVED: ${diff.medicationsRemoved.join(', ')}`);
+    if (diff.statusChanges.length)     lines.push(`- TEST STATUS CHANGES: ${diff.statusChanges.join('; ')}`);
+    if (diff.descriptionChanged)
+      lines.push(`- DESCRIPTION changed: "${oldEvent.description}" → "${newEvent.description}"`);
+    if (diff.statusChanged)
+      lines.push(`- RECORD STATUS changed: ${oldEvent.status} → ${newEvent.status}`);
+    lines.push('', 'Are these corrections clinically significant? Provide a brief actionable assessment (2-3 sentences).');
+    return lines.join('\n');
+  }
+
+  async reanalyzeEventChanges(
+    userId: string,
+    oldEvent: any,
+    newEvent: any,
+    modelId = DEFAULT_MODEL
+  ): Promise<{ analysis: string; profileUpdated: boolean }> {
+    const diff = this._computeEventDiff(oldEvent, newEvent);
+    if (!diff.hasChanges) {
+      return { analysis: 'No significant changes detected.', profileUpdated: false };
+    }
+
+    const llm = this.getLLM(modelId);
+    const prompt = this._buildDiffPrompt(diff, oldEvent, newEvent);
+    let analysis = '';
+    try {
+      const res = await llm.invoke([
+        new SystemMessage('You are a medical AI assistant reviewing corrections to a patient health record. Be concise and clinically focused.'),
+        new HumanMessage(prompt),
+      ]);
+      analysis = res.content as string;
+    } catch (err: any) {
+      this.logger.error('reanalyzeEventChanges LLM call failed:', err.message);
+      analysis = 'Analysis unavailable — record updated successfully.';
+    }
+
+    // Re-embed the updated record
+    const eventText =
+      `${newEvent.eventType} on ${new Date(newEvent.date).toISOString().slice(0, 10)}: ` +
+      `${(newEvent.titles || []).join(', ')} — ${newEvent.description || ''} (${newEvent.status || ''})`;
+    await this.embedAndStore(userId, newEvent._id.toString(), 'HEALTH_EVENT', eventText, new Date(newEvent.date).toISOString());
+
+    // Update user profile if conditions/medications changed
+    let profileUpdated = false;
+    if (diff.conditionsAdded.length || diff.conditionsRemoved.length || diff.medicationsAdded.length) {
+      try {
+        const currentUser = await this.userService.findOne(userId);
+        if (currentUser) {
+          let conditions = [...(currentUser.medicalConditions ?? [])].filter(c => !diff.conditionsRemoved.includes(c));
+          conditions = Array.from(new Set([...conditions, ...diff.conditionsAdded]));
+          const medications = Array.from(new Set([...(currentUser.medications ?? []), ...diff.medicationsAdded]));
+          await this.userService.update(userId, { medicalConditions: conditions, medications });
+          profileUpdated = true;
+        }
+      } catch (err: any) {
+        this.logger.warn('Failed to update user profile during reanalysis:', err.message);
+      }
+    }
+
+    return { analysis, profileUpdated };
   }
 
   private _buildProfileText(p: UserProfileSnapshot): string {

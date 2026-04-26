@@ -10,6 +10,7 @@ import {
   BadRequestException,
   Res,
   Logger,
+  Put,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
@@ -97,6 +98,18 @@ export class AgentController {
     } finally {
       if (!res.writableEnded) res.end();
     }
+  }
+
+  @Post(':userId/reanalyze')
+  async reanalyzeEvent(
+    @Param('userId') userId: string,
+    @Body() body: { oldEvent: any; newEvent: any; model?: string }
+  ) {
+    const user = await this.userService.findOne(userId);
+    if (!user) throw new NotFoundException('User not found');
+    return this.agentService.reanalyzeEventChanges(
+      userId, body.oldEvent, body.newEvent, body.model || DEFAULT_MODEL
+    );
   }
 
   @Post(':userId/chat-with-file')
