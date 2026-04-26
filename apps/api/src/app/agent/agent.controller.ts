@@ -112,6 +112,30 @@ export class AgentController {
     );
   }
 
+  @Post(':userId/reanalyze-diet')
+  async reanalyzeDiet(
+    @Param('userId') userId: string,
+    @Body() body: { oldLog: any; newLog: any; model?: string }
+  ) {
+    const user = await this.userService.findOne(userId);
+    if (!user) throw new NotFoundException('User not found');
+    return this.agentService.reanalyzeDietChanges(
+      userId, body.oldLog, body.newLog, body.model || DEFAULT_MODEL
+    );
+  }
+
+  @Post(':userId/reanalyze-lifestyle')
+  async reanalyzeLifestyle(
+    @Param('userId') userId: string,
+    @Body() body: { oldRec: any; newRec: any; model?: string }
+  ) {
+    const user = await this.userService.findOne(userId);
+    if (!user) throw new NotFoundException('User not found');
+    return this.agentService.reanalyzeLifestyleChanges(
+      userId, body.oldRec, body.newRec, body.model || DEFAULT_MODEL
+    );
+  }
+
   @Post(':userId/chat-with-file')
   @UseInterceptors(
     FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } })

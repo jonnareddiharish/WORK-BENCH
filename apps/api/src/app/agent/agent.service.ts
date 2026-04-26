@@ -824,6 +824,82 @@ export class AgentService {
     return { analysis, profileUpdated };
   }
 
+  async reanalyzeDietChanges(
+    userId: string,
+    oldLog: any,
+    newLog: any,
+    modelId = DEFAULT_MODEL
+  ): Promise<{ analysis: string }> {
+    const oldMeds: string[] = (oldLog.medicationItems ?? []).map((m: any) => m.name);
+    const newMeds: string[] = (newLog.medicationItems ?? []).map((m: any) => m.name);
+    const medsAdded   = newMeds.filter(m => !oldMeds.includes(m));
+    const medsRemoved = oldMeds.filter(m => !newMeds.includes(m));
+    const descChanged = (oldLog.description ?? '') !== (newLog.description ?? '');
+    const hasChanges  = medsAdded.length > 0 || medsRemoved.length > 0 || descChanged;
+
+    let analysis = 'No significant changes detected.';
+    if (hasChanges) {
+      const llm = this.getLLM(modelId);
+      const lines = [`Diet log type: ${newLog.cardType || 'GENERAL'}`];
+      if (medsAdded.length)   lines.push(`Medications added: ${medsAdded.join(', ')}`);
+      if (medsRemoved.length) lines.push(`Medications removed: ${medsRemoved.join(', ')}`);
+      if (descChanged)        lines.push('Content updated.');
+      lines.push('', 'Briefly assess the clinical significance of these changes (2-3 sentences).');
+      try {
+        const res = await llm.invoke([
+          new SystemMessage('You are a medical AI assistant reviewing corrections to a patient diet log. Be concise.'),
+          new HumanMessage(lines.join('\n')),
+        ]);
+        analysis = res.content as string;
+      } catch (err: any) {
+        analysis = 'Diet log updated successfully.';
+      }
+
+      const embedText = (newLog.medicationItems?.length ?? 0) > 0
+        ? `Doctor medications: ${newLog.medicationItems.map((m: any) => m.name).join(', ')}`
+        : `Doctor diet advice: ${(newLog.description ?? '').slice(0, 200)}`;
+      await this.embedAndStore(userId, newLog._id.toString(), 'DIET_LOG', embedText, new Date(newLog.date).toISOString());
+    }
+
+    return { analysis };
+  }
+
+  async reanalyzeLifestyleChanges(
+    userId: string,
+    oldRec: any,
+    newRec: any,
+    modelId = DEFAULT_MODEL
+  ): Promise<{ analysis: string }> {
+    const descChanged = (oldRec.description ?? '') !== (newRec.description ?? '');
+    const oldCats: string[] = [...(oldRec.categories ?? [])].sort();
+    const newCats: string[] = [...(newRec.categories ?? [])].sort();
+    const catsChanged = JSON.stringify(oldCats) !== JSON.stringify(newCats);
+    const hasChanges  = descChanged || catsChanged;
+
+    let analysis = 'No significant changes detected.';
+    if (hasChanges) {
+      const llm = this.getLLM(modelId);
+      const lines = ['Lifestyle record updated.'];
+      if (catsChanged) lines.push(`Categories changed from [${oldCats.join(', ')}] to [${newCats.join(', ')}].`);
+      if (descChanged) lines.push('Content updated.');
+      lines.push('', 'In 1-2 sentences, assess if these lifestyle changes are clinically relevant.');
+      try {
+        const res = await llm.invoke([
+          new SystemMessage('You are a medical AI assistant reviewing corrections to a patient lifestyle record. Be brief.'),
+          new HumanMessage(lines.join('\n')),
+        ]);
+        analysis = res.content as string;
+      } catch (err: any) {
+        analysis = 'Lifestyle record updated successfully.';
+      }
+
+      const embedText = `Doctor lifestyle advice: ${(newRec.description ?? '').slice(0, 200)}`;
+      await this.embedAndStore(userId, newRec._id.toString(), 'LIFESTYLE', embedText, new Date(newRec.date).toISOString());
+    }
+
+    return { analysis };
+  }
+
   private _buildProfileText(p: UserProfileSnapshot): string {
     return (
       `Name: ${p.name} | Sex: ${p.biologicalSex || 'unknown'} | ` +
