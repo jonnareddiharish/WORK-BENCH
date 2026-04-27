@@ -1,0 +1,24 @@
+{
+  "name": "camunda-worker",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "libs/camunda-worker/src",
+  "projectType": "library",
+  "tags": ["lib", "camunda"],
+  "targets": {
+    "build": {
+      "executor": "@nx/js:tsc",
+      "outputs": ["{workspaceRoot}/dist/libs/camunda-worker"],
+      "options": {
+        "outputPath": "dist/libs/camunda-worker",
+        "main": "libs/camunda-worker/src/index.ts",
+        "tsConfig": "libs/camunda-worker/tsconfig.lib.json",
+        "assets": []
+      }
+    },
+    "test": {
+      "options": {
+        "passWithNoTests": true
+      }
+    }
+  }
+}
