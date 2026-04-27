@@ -2,17 +2,17 @@ import { useState, useRef, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   BrainCircuit, ChevronLeft, ChevronRight, Paperclip,
-  FileScan, Cpu, Zap, Wind, X,
+  FileScan, Cpu, Zap, Wind, X, Settings, CheckCircle2, Star,
 } from 'lucide-react';
 import { API_BASE } from '../lib/api';
-import { getDefaultModel } from '../lib/modelPreference';
+import { getDefaultModel, saveDefaultModel } from '../lib/modelPreference';
 import type { ChatMessage, ChatModelId } from '../types';
 
-const MODELS: { id: ChatModelId; label: string; note: string; icon: typeof Cpu; activeClass: string; cardClass: string }[] = [
-  { id: 'claude-sonnet-4-6',       label: 'Claude',  note: 'Anthropic Claude Sonnet 4.6 — best accuracy',  icon: BrainCircuit, activeClass: 'bg-violet-100 text-violet-700 border-violet-300', cardClass: 'border-violet-200 bg-violet-50' },
-  { id: 'gpt-4o-mini',             label: 'GPT-4o',  note: 'OpenAI GPT-4o mini — fast & capable',           icon: Cpu,          activeClass: 'bg-emerald-100 text-emerald-700 border-emerald-300', cardClass: 'border-emerald-200 bg-emerald-50' },
-  { id: 'llama-3.3-70b-versatile', label: 'Llama',   note: 'Meta Llama 3.3 70B via Groq — open-source',    icon: Zap,          activeClass: 'bg-amber-100 text-amber-700 border-amber-300',         cardClass: 'border-amber-200 bg-amber-50' },
-  { id: 'gemini-1.5-flash',        label: 'Gemini',  note: 'Google Gemini 1.5 Flash — multimodal',          icon: Wind,         activeClass: 'bg-sky-100 text-sky-700 border-sky-300',                cardClass: 'border-sky-200 bg-sky-50' },
+const MODELS: { id: ChatModelId; label: string; provider: string; description: string; icon: typeof Cpu; activeClass: string; ring: string }[] = [
+  { id: 'claude-sonnet-4-6',       label: 'Claude Sonnet 4.6', provider: 'Anthropic', description: 'Best accuracy for medical reasoning, medication analysis, and report parsing.', icon: BrainCircuit, activeClass: 'bg-violet-100 text-violet-700 border-violet-300', ring: 'ring-violet-300 border-violet-200' },
+  { id: 'gpt-4o-mini',             label: 'GPT-4o mini',        provider: 'OpenAI',    description: 'Fast and capable. Good for general health questions and diet recommendations.', icon: Cpu,          activeClass: 'bg-emerald-100 text-emerald-700 border-emerald-300', ring: 'ring-emerald-300 border-emerald-200' },
+  { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B',      provider: 'Meta · Groq', description: 'Open-source model via Groq for ultra-low latency. Great for quick queries.',  icon: Zap,          activeClass: 'bg-amber-100 text-amber-700 border-amber-300',         ring: 'ring-amber-300 border-amber-200' },
+  { id: 'gemini-1.5-flash',        label: 'Gemini 1.5 Flash',   provider: 'Google',    description: 'Multimodal — can analyse images. Ideal for sharing medical scan photos.',       icon: Wind,         activeClass: 'bg-sky-100 text-sky-700 border-sky-300',                ring: 'ring-sky-300 border-sky-200' },
 ];
 
 export function AIChatPage() {
@@ -25,6 +25,9 @@ export function AIChatPage() {
   const [submitting, setSubmitting] = useState(false);
   const [attachedFile, setFile]     = useState<File | null>(null);
   const [filePreview, setPreview]   = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [defaultModel, setDefaultModelState] = useState<ChatModelId>(getDefaultModel());
+  const [savedPulse, setSavedPulse] = useState<ChatModelId | null>(null);
 
   const endRef   = useRef<HTMLDivElement>(null);
   const fileRef  = useRef<HTMLInputElement>(null);
@@ -135,6 +138,13 @@ export function AIChatPage() {
     }
   };
 
+  const handleSetDefault = (id: ChatModelId) => {
+    saveDefaultModel(id);
+    setDefaultModelState(id);
+    setSavedPulse(id);
+    setTimeout(() => setSavedPulse(null), 1800);
+  };
+
   const activeModel = MODELS.find(m => m.id === model)!;
 
   return (
@@ -151,8 +161,8 @@ export function AIChatPage() {
       <div className="flex-1 bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden flex flex-col min-h-0">
 
         {/* Header */}
-        <div className="flex-shrink-0 bg-gradient-to-r from-indigo-600 to-violet-700 px-6 py-5 text-white">
-          <div className="flex items-center justify-between mb-4">
+        <div className="flex-shrink-0 bg-gradient-to-r from-indigo-600 to-violet-700 px-6 py-4 text-white">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className="w-9 h-9 bg-white/20 rounded-xl flex items-center justify-center border border-white/30">
                 <BrainCircuit className="w-5 h-5" />
@@ -162,28 +172,108 @@ export function AIChatPage() {
                 <p className="text-[11px] text-white/60">Powered by {activeModel.label}</p>
               </div>
             </div>
-          </div>
 
-          {/* Model selector */}
-          <div className="flex items-center gap-2 flex-wrap">
-            {MODELS.map(m => (
-              <button
-                key={m.id}
-                onClick={() => setModel(m.id)}
-                disabled={submitting}
-                title={m.note}
-                className={`px-4 py-1.5 rounded-full text-xs font-bold border transition-all disabled:opacity-40 ${
-                  model === m.id ? m.activeClass : 'bg-white/10 text-white/70 border-white/20 hover:bg-white/20 hover:text-white'
-                }`}
-              >
-                {m.label}
-              </button>
-            ))}
-            <span className="ml-2 text-[10px] text-white/40 hidden sm:block">{activeModel.note}</span>
+            <button
+              onClick={() => setSettingsOpen(v => !v)}
+              title="Model settings"
+              className={`p-2.5 rounded-xl border transition-all ${
+                settingsOpen
+                  ? 'bg-white/25 border-white/40 text-white'
+                  : 'bg-white/10 border-white/20 text-white/70 hover:bg-white/20 hover:text-white'
+              }`}
+            >
+              <Settings className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
+        {/* Settings panel — replaces message area when open */}
+        {settingsOpen && (
+          <div className="flex-1 overflow-y-auto p-6 bg-slate-50 min-h-0">
+            <div className="max-w-2xl mx-auto">
+              <div className="flex items-center justify-between mb-5">
+                <div>
+                  <h3 className="text-sm font-black text-slate-800">AI Model</h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">Choose model for this session · star to set as default</p>
+                </div>
+                <button onClick={() => setSettingsOpen(false)} className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition-colors">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {MODELS.map(m => {
+                  const Icon    = m.icon;
+                  const active  = model === m.id;
+                  const isDefault = defaultModel === m.id;
+                  const justSaved = savedPulse === m.id;
+
+                  return (
+                    <div
+                      key={m.id}
+                      onClick={() => { setModel(m.id); }}
+                      className={`relative group cursor-pointer p-4 rounded-2xl border-2 transition-all hover:shadow-md ${
+                        active ? `${m.ring} ring-2 bg-white shadow-sm` : 'border-slate-200 bg-white hover:border-slate-300'
+                      }`}
+                    >
+                      {/* Star / default button */}
+                      <button
+                        onClick={e => { e.stopPropagation(); handleSetDefault(m.id); setModel(m.id); }}
+                        title={isDefault ? 'Default model' : 'Set as default'}
+                        className={`absolute top-3 right-3 p-1 rounded-lg transition-all ${
+                          isDefault
+                            ? 'text-amber-500'
+                            : 'text-slate-200 hover:text-amber-400 group-hover:text-slate-300'
+                        }`}
+                      >
+                        <Star className={`w-4 h-4 ${isDefault ? 'fill-amber-400' : ''}`} />
+                      </button>
+
+                      <div className="flex items-center gap-3 mb-2.5 pr-6">
+                        <div className={`p-2 rounded-xl ${active ? m.activeClass : 'bg-slate-100 text-slate-500'}`}>
+                          <Icon className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <p className="text-sm font-bold text-slate-800">{m.label}</p>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${active ? m.activeClass : 'bg-slate-100 text-slate-400'}`}>
+                            {m.provider}
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="text-xs text-slate-500 leading-relaxed">{m.description}</p>
+
+                      <div className="flex items-center justify-between mt-3">
+                        {active && (
+                          <div className="flex items-center gap-1 text-[10px] font-bold text-indigo-600">
+                            <CheckCircle2 className="w-3 h-3" /> Active session
+                          </div>
+                        )}
+                        {justSaved && (
+                          <div className="flex items-center gap-1 text-[10px] font-bold text-amber-600 ml-auto">
+                            <Star className="w-3 h-3 fill-amber-400" /> Saved as default
+                          </div>
+                        )}
+                        {isDefault && !justSaved && (
+                          <div className="flex items-center gap-1 text-[10px] font-bold text-amber-500 ml-auto">
+                            <Star className="w-3 h-3 fill-amber-400" /> Default
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <p className="text-[11px] text-slate-400 mt-5 text-center">
+                You can switch model at any time. Starred model is loaded automatically on your next chat.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Messages */}
+        {!settingsOpen && (
         <div className="flex-1 overflow-y-auto p-6 space-y-5 bg-slate-50 min-h-0">
           {messages.length === 0 ? (
             <div className="h-full flex flex-col items-center justify-center text-center px-8">
@@ -249,8 +339,9 @@ export function AIChatPage() {
           )}
           <div ref={endRef} />
         </div>
+        )}
 
-        {/* Input area */}
+        {/* Input area — always visible */}
         <div className="flex-shrink-0 border-t border-slate-100 bg-white">
           {attachedFile && (
             <div className="px-6 pt-4 pb-0">
