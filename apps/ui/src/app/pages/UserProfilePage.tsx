@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   BrainCircuit, MessageSquare, ChevronLeft, CalendarDays,
-  ShieldAlert, User, PanelRight, X,
+  ShieldAlert, User, PanelRight, X, ExternalLink,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { getInitials } from '../lib/utils';
@@ -214,6 +214,13 @@ export function UserProfilePage() {
                 </div>
                 <span className="text-sm font-bold">AI Health Insights</span>
                 <span className="text-[10px] text-white/50 font-medium">Personalised for {user.name}</span>
+                <button
+                  onClick={() => navigate(`/insights/${userId}`)}
+                  title="Open full insights + chat view"
+                  className="p-1 rounded-lg bg-white/10 hover:bg-white/25 border border-white/20 transition-colors"
+                >
+                  <ExternalLink className="w-3 h-3 text-white/70" />
+                </button>
               </div>
               <motion.button
                 whileHover={{ scale: 1.02 }}
@@ -227,12 +234,12 @@ export function UserProfilePage() {
               </motion.button>
             </div>
 
-            <div className="p-6">
+            <div className="p-6 cursor-pointer" onClick={() => navigate(`/insights/${userId}`)}>
               <div className={`grid gap-4 ${insights.length === 1 ? 'grid-cols-1' : insights.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
                 {insights.map((ins, i) => {
                   const Icon = ins.icon;
                   return (
-                    <div key={i} className="flex items-start gap-3 bg-white/10 rounded-2xl p-4 border border-white/10 hover:bg-white/15 transition-colors">
+                    <div key={i} className="flex items-start gap-3 bg-white/10 rounded-2xl p-4 border border-white/10 hover:bg-white/20 transition-colors">
                       <div className={`p-2 ${ins.bg} rounded-xl flex-shrink-0`}>
                         <Icon className={`w-4 h-4 ${ins.color}`} />
                       </div>

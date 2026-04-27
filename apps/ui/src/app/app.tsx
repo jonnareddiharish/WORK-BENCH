@@ -4,6 +4,7 @@ import { DashboardPage } from './pages/DashboardPage';
 import { UserProfilePage } from './pages/UserProfilePage';
 import { RecordDetailPage } from './pages/RecordDetailPage';
 import { AIChatPage } from './pages/AIChatPage';
+import { AIInsightsPage } from './pages/AIInsightsPage';
 import { FamilyGraphPage } from './pages/FamilyGraphPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
@@ -17,7 +18,8 @@ export function App() {
         <Route path="dashboard"           element={<DashboardPage />} />
         <Route path="dashboard/:id"       element={<UserProfilePage />} />
         <Route path="dashboard/:id/:type" element={<RecordDetailPage />} />
-        <Route path="chat/:userId"        element={<AIChatPage />} />
+        <Route path="chat/:userId"          element={<AIChatPage />} />
+        <Route path="insights/:userId"    element={<AIInsightsPage />} />
         <Route path="graph"               element={<FamilyGraphPage />} />
         <Route path="reports"             element={<ReportsPage />} />
         <Route path="settings"            element={<SettingsPage />} />

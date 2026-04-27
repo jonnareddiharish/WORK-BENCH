@@ -26,6 +26,7 @@ export function buildInsights(
   healthEvents: HealthEvent[],
   dietLogs: DietLog[],
   lifestyleRecords: LifestyleRecord[],
+  limit = 3,
 ): Insight[] {
   const insights: Insight[] = [];
   const conditions = user.medicalConditions ?? [];
@@ -101,7 +102,7 @@ export function buildInsights(
     });
   }
 
-  return insights.slice(0, 3);
+  return insights.slice(0, limit);
 }
 
 export function AIInsightsWidget({ user, healthEvents, dietLogs, lifestyleRecords, onOpenChat }: Props) {
