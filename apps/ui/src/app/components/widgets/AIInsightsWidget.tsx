@@ -13,7 +13,7 @@ interface Props {
   onOpenChat: () => void;
 }
 
-interface Insight {
+export interface Insight {
   icon: typeof Activity;
   color: string;
   bg: string;
@@ -21,7 +21,7 @@ interface Insight {
   body: string;
 }
 
-function buildInsights(
+export function buildInsights(
   user: User,
   healthEvents: HealthEvent[],
   dietLogs: DietLog[],

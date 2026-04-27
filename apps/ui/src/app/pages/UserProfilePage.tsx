@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   BrainCircuit, MessageSquare, ChevronLeft, CalendarDays,
-  ShieldAlert, Pill, User,
+  ShieldAlert, User, PanelRight, X,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { getInitials } from '../lib/utils';
@@ -11,11 +11,10 @@ import { createHealthEvent, createDietLog, createLifestyle } from '../lib/api';
 import { RemindersWidget } from '../components/reminders/RemindersWidget';
 import { RecordsBoard } from '../components/records/RecordsBoard';
 import { MealPlanWidget } from '../components/meal-plan/MealPlanWidget';
-import { AIChatPanel } from '../components/chat/AIChatPanel';
-import { AIInsightsWidget } from '../components/widgets/AIInsightsWidget';
+import { buildInsights } from '../components/widgets/AIInsightsWidget';
 import { TodayMedicationsWidget } from '../components/widgets/TodayMedicationsWidget';
 import { AppointmentsCalendar } from '../components/widgets/AppointmentsCalendar';
-import { PageSpinner, SkeletonCard } from '../components/ui/Spinner';
+import { PageSpinner } from '../components/ui/Spinner';
 import { Modal } from '../components/ui/Modal';
 import type { MealPlan } from '../types';
 
@@ -40,7 +39,7 @@ export function UserProfilePage() {
     useDashboardData(userId);
 
   const [activeTab, setActiveTab]   = useState<RecordTab>('health');
-  const [chatOpen, setChatOpen]     = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [currentPlan, setCurrentPlan] = useState<MealPlan | null>(null);
 
   // Add-record modals
@@ -54,6 +53,7 @@ export function UserProfilePage() {
   const [newLifestyle, setNewLifestyle] = useState({ categories: 'GENERAL', description: '', date: new Date().toISOString().split('T')[0] });
 
   const activePlan = currentPlan ?? initPlan;
+  const insights   = user ? buildInsights(user, healthEvents, dietLogs, lifestyleRecords) : [];
 
   if (loading) return <PageSpinner />;
   if (error || !user) return (
@@ -101,9 +101,6 @@ export function UserProfilePage() {
 
   return (
     <>
-      {/* AI Chat */}
-      <AIChatPanel userId={userId} isOpen={chatOpen} onClose={() => setChatOpen(false)} />
-
       {/* Add Health Modal */}
       <Modal open={healthModal} onClose={() => setHealthModal(false)} title="Add Health Record" size="md">
         <form onSubmit={handleAddHealth} className="space-y-4">
@@ -205,56 +202,90 @@ export function UserProfilePage() {
           <ChevronLeft className="w-4 h-4" /> All Members
         </button>
 
-        {/* Profile header */}
-        <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
-          <div className={`h-2 bg-gradient-to-r ${avatarGrad(user.name)}`} />
-          <div className="p-6 flex items-center gap-5 flex-wrap">
-            <div className={`w-16 h-16 rounded-2xl bg-gradient-to-br ${avatarGrad(user.name)} flex items-center justify-center text-white font-extrabold text-2xl shadow-lg flex-shrink-0`}>
-              {getInitials(user.name)}
-            </div>
-            <div className="flex-1 min-w-0">
-              <h2 className="text-xl font-black text-slate-900">{user.name}</h2>
-              <div className="flex items-center gap-3 mt-1 flex-wrap">
-                <div className="flex items-center gap-1.5 text-slate-400">
-                  <CalendarDays className="w-3.5 h-3.5" />
-                  <span className="text-xs">{new Date(user.dob).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}</span>
+        {/* Header: same grid as content (2+1 cols) so panels align perfectly */}
+        <div className="grid grid-cols-3 gap-6 items-start">
+
+          {/* col-span-2 — AI Suggestions + Agent Interaction */}
+          <div className="col-span-2 bg-gradient-to-br from-indigo-600 via-violet-600 to-indigo-700 rounded-3xl shadow-lg shadow-indigo-200 text-white overflow-hidden">
+            <div className="px-6 py-4 flex items-center justify-between border-b border-white/10">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-white/15 rounded-xl border border-white/20">
+                  <BrainCircuit className="w-4 h-4" />
                 </div>
-                {user.biologicalSex && (
-                  <div className="flex items-center gap-1.5 text-slate-400">
-                    <User className="w-3.5 h-3.5" />
-                    <span className="text-xs">{user.biologicalSex}</span>
+                <span className="text-sm font-bold">AI Health Insights</span>
+                <span className="text-[10px] text-white/50 font-medium">Personalised for {user.name}</span>
+              </div>
+              <motion.button
+                whileHover={{ scale: 1.02 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => navigate(`/chat/${userId}`)}
+                className="flex items-center gap-2 px-4 py-2 bg-white text-indigo-700 font-bold text-xs rounded-2xl shadow hover:bg-indigo-50 transition-all"
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                Ask AI Health Agent
+                <BrainCircuit className="w-3.5 h-3.5 opacity-60" />
+              </motion.button>
+            </div>
+
+            <div className="p-6">
+              <div className={`grid gap-4 ${insights.length === 1 ? 'grid-cols-1' : insights.length === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+                {insights.map((ins, i) => {
+                  const Icon = ins.icon;
+                  return (
+                    <div key={i} className="flex items-start gap-3 bg-white/10 rounded-2xl p-4 border border-white/10 hover:bg-white/15 transition-colors">
+                      <div className={`p-2 ${ins.bg} rounded-xl flex-shrink-0`}>
+                        <Icon className={`w-4 h-4 ${ins.color}`} />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-black uppercase tracking-wider text-white/60 mb-1">{ins.title}</p>
+                        <p className="text-sm text-white/90 leading-relaxed">{ins.body}</p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* col-span-1 — User info (conditions only) */}
+          <div className="col-span-1">
+            <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className={`h-1.5 bg-gradient-to-r ${avatarGrad(user.name)}`} />
+              <div className="p-4">
+                <div className="flex items-center gap-3 mb-4">
+                  <div className={`w-10 h-10 rounded-xl bg-gradient-to-br ${avatarGrad(user.name)} flex items-center justify-center text-white font-extrabold text-lg shadow flex-shrink-0`}>
+                    {getInitials(user.name)}
+                  </div>
+                  <div className="min-w-0">
+                    <h2 className="text-sm font-black text-slate-900 truncate">{user.name}</h2>
+                    <div className="flex items-center gap-1 text-slate-400 mt-0.5">
+                      <CalendarDays className="w-3 h-3" />
+                      <span className="text-[10px]">{new Date(user.dob).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</span>
+                    </div>
+                    {user.biologicalSex && (
+                      <div className="flex items-center gap-1 text-slate-400">
+                        <User className="w-3 h-3" />
+                        <span className="text-[10px]">{user.biologicalSex}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {(user.medicalConditions ?? []).length > 0 && (
+                  <div>
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <ShieldAlert className="w-3 h-3 text-rose-500 flex-shrink-0" />
+                      <span className="text-[9px] font-black uppercase tracking-wider text-slate-400">Conditions</span>
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      {user.medicalConditions!.map(c => (
+                        <span key={c} className="text-[10px] font-bold px-2.5 py-1 bg-rose-50 text-rose-600 border border-rose-100 rounded-xl leading-snug">{c}</span>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
-              {(user.medicalConditions ?? []).length > 0 && (
-                <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                  <ShieldAlert className="w-3 h-3 text-rose-500 flex-shrink-0" />
-                  {user.medicalConditions!.map(c => (
-                    <span key={c} className="text-[10px] font-bold px-2 py-0.5 bg-rose-50 text-rose-600 border border-rose-100 rounded-full">{c}</span>
-                  ))}
-                </div>
-              )}
-              {(user.medications ?? []).length > 0 && (
-                <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-                  <Pill className="w-3 h-3 text-indigo-500 flex-shrink-0" />
-                  {user.medications!.map(m => (
-                    <span key={m} className="text-[10px] font-bold px-2 py-0.5 bg-indigo-50 text-indigo-600 border border-indigo-100 rounded-full">{m}</span>
-                  ))}
-                </div>
-              )}
             </div>
-
-            {/* AI Chat button */}
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-              onClick={() => setChatOpen(true)}
-              className="flex items-center gap-2.5 px-5 py-3 bg-gradient-to-r from-indigo-600 to-violet-600 text-white font-bold text-sm rounded-2xl shadow-lg shadow-indigo-200 transition-all flex-shrink-0"
-            >
-              <MessageSquare className="w-4 h-4" />
-              AI Health Agent
-              <BrainCircuit className="w-4 h-4 opacity-70" />
-            </motion.button>
           </div>
         </div>
 
@@ -265,22 +296,35 @@ export function UserProfilePage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Left col: Records board */}
-          <div className="lg:col-span-2 space-y-0">
-            {/* Tab bar */}
-            <div className="flex bg-white border border-slate-200 rounded-2xl p-1 mb-4 gap-1 shadow-sm">
-              {tabs.map(tab => (
-                <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex-1 py-2 text-xs font-bold rounded-xl transition-all ${
-                    activeTab === tab.id
-                      ? 'bg-slate-900 text-white shadow-sm'
-                      : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50'
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
+          <div className={`${sidebarOpen ? 'lg:col-span-2' : 'lg:col-span-3'} space-y-0 transition-all`}>
+            {/* Tab bar + sidebar toggle */}
+            <div className="flex items-center gap-2 mb-4">
+              <div className="flex flex-1 bg-white border border-slate-200 rounded-2xl p-1 gap-1 shadow-sm">
+                {tabs.map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`flex-1 py-2 text-xs font-bold rounded-xl transition-all ${
+                      activeTab === tab.id
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => setSidebarOpen(v => !v)}
+                className={`flex items-center gap-1.5 px-3 py-2.5 rounded-2xl border text-xs font-bold shadow-sm transition-all flex-shrink-0 ${
+                  sidebarOpen
+                    ? 'bg-indigo-600 border-indigo-600 text-white hover:bg-indigo-700'
+                    : 'bg-white border-slate-200 text-slate-500 hover:text-indigo-600 hover:border-indigo-200'
+                }`}
+                title={sidebarOpen ? 'Hide panel' : 'Show panel'}
+              >
+                {sidebarOpen ? <X className="w-3.5 h-3.5" /> : <PanelRight className="w-3.5 h-3.5" />}
+              </button>
             </div>
 
             {activeTab === 'health' && (
@@ -312,52 +356,46 @@ export function UserProfilePage() {
             )}
           </div>
 
-          {/* Right col: AI insights, widgets, meal plan */}
-          <div className="space-y-5">
-            <AIInsightsWidget
-              user={user}
-              healthEvents={healthEvents}
-              dietLogs={dietLogs}
-              lifestyleRecords={lifestyleRecords}
-              onOpenChat={() => setChatOpen(true)}
-            />
+          {/* Right col: Today's meds, appointments, meal plan (hidden by default) */}
+          {sidebarOpen && (
+            <div className="space-y-5">
+              <TodayMedicationsWidget
+                dietLogs={dietLogs}
+                healthEvents={healthEvents}
+              />
 
-            <TodayMedicationsWidget
-              dietLogs={dietLogs}
-              healthEvents={healthEvents}
-            />
+              <AppointmentsCalendar
+                reminders={reminders}
+                userId={userId}
+                onDismiss={dismissReminder}
+              />
 
-            <AppointmentsCalendar
-              reminders={reminders}
-              userId={userId}
-              onDismiss={dismissReminder}
-            />
+              <MealPlanWidget
+                userId={userId}
+                mealPlan={activePlan}
+                loading={false}
+                onPlanUpdated={plan => setCurrentPlan(plan)}
+              />
 
-            <MealPlanWidget
-              userId={userId}
-              mealPlan={activePlan}
-              loading={false}
-              onPlanUpdated={plan => setCurrentPlan(plan)}
-            />
-
-            {/* Quick stats */}
-            <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-5 space-y-3">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Quick Stats</p>
-              {[
-                { label: 'Health Records', count: healthEvents.length,    color: 'bg-indigo-500' },
-                { label: 'Diet Logs',      count: dietLogs.length,         color: 'bg-teal-500' },
-                { label: 'Lifestyle',      count: lifestyleRecords.length, color: 'bg-blue-500' },
-              ].map(stat => (
-                <div key={stat.label} className="flex items-center justify-between">
-                  <div className="flex items-center gap-2.5">
-                    <div className={`w-2 h-2 rounded-full ${stat.color}`} />
-                    <span className="text-xs font-medium text-slate-600">{stat.label}</span>
+              {/* Quick stats */}
+              <div className="bg-white rounded-3xl border border-slate-100 shadow-sm p-5 space-y-3">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Quick Stats</p>
+                {[
+                  { label: 'Health Records', count: healthEvents.length,    color: 'bg-indigo-500' },
+                  { label: 'Diet Logs',      count: dietLogs.length,         color: 'bg-teal-500' },
+                  { label: 'Lifestyle',      count: lifestyleRecords.length, color: 'bg-blue-500' },
+                ].map(stat => (
+                  <div key={stat.label} className="flex items-center justify-between">
+                    <div className="flex items-center gap-2.5">
+                      <div className={`w-2 h-2 rounded-full ${stat.color}`} />
+                      <span className="text-xs font-medium text-slate-600">{stat.label}</span>
+                    </div>
+                    <span className="text-sm font-black text-slate-800">{stat.count}</span>
                   </div>
-                  <span className="text-sm font-black text-slate-800">{stat.count}</span>
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </div>
     </>

@@ -29,7 +29,7 @@ function avatarColor(name: string) {
 }
 
 export function AppLayout() {
-  const [collapsed, setCollapsed]       = useState(false);
+  const [collapsed, setCollapsed]       = useState(true);
   const [users, setUsers]               = useState<User[]>([]);
   const [selectorOpen, setSelectorOpen] = useState(false);
   const [selectedUser, setSelectedUser] = useState<User | null>(null);
