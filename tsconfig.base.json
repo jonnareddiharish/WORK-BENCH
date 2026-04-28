@@ -16,7 +16,8 @@
     "baseUrl": ".",
     "paths": {
       "@work-bench/camunda-worker": ["libs/camunda-worker/src/index.ts"],
-      "@work-bench/types": ["libs/types/src/index.ts"]
+      "@work-bench/types": ["libs/types/src/index.ts"],
+      "@work-bench/commons": ["libs/commons/src/index.ts"]
     }
   },
   "exclude": ["node_modules", "tmp"]

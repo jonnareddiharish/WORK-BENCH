@@ -22,9 +22,6 @@ export class HealthSummaryWorker extends CamundaWorker {
     // TODO: call AI health summary service here
     // const summary = await this.healthService.generateSummary(userId);
 
-    await taskService.complete(task, {
-      healthSummaryGenerated: true,
-      // healthSummary: summary,
-    });
+    await this.completeTask(taskService, task, { healthSummaryGenerated: true });
   }
 }

@@ -48,7 +48,7 @@ export default function Worker(workerKey: string) {
     WrappedConstructor.prototype = originalConstructor.prototype;
     Object.defineProperty(WrappedConstructor, 'name', { value: TargetClass.name });
 
-    // Copy all static metadata (needed for NestJS DI reflection)
+    // Copy all enumerable static properties (e.g. NestJS guard/pipe metadata).
     Object.getOwnPropertyNames(originalConstructor).forEach((prop) => {
       if (!['length', 'prototype', 'name', 'caller', 'arguments'].includes(prop)) {
         try {
@@ -62,6 +62,14 @@ export default function Worker(workerKey: string) {
         }
       }
     });
+
+    // Copy Reflect metadata (stored in a WeakMap — not visible to Object.getOwnPropertyNames).
+    // This includes `design:paramtypes` which TypeScript's emitDecoratorMetadata writes onto the
+    // ORIGINAL class before any decorator runs. Without this copy, NestJS reads paramtypes from
+    // WrappedConstructor, finds nothing, and injects undefined for every constructor argument.
+    for (const key of Reflect.getMetadataKeys(originalConstructor)) {
+      Reflect.defineMetadata(key, Reflect.getMetadata(key, originalConstructor), WrappedConstructor);
+    }
 
     return WrappedConstructor as unknown as T;
   };

@@ -2,6 +2,13 @@ const { NxAppWebpackPlugin } = require('@nx/webpack/app-plugin');
 const { join } = require('path');
 
 module.exports = {
+  externals: [
+    /^pino/,
+    'thread-stream',
+    'sonic-boom',
+    'real-require',
+    'on-exit-leak-free',
+  ],
   output: {
     path: join(__dirname, '../../dist/apps/api'),
     clean: true,

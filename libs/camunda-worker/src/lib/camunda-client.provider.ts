@@ -23,24 +23,24 @@ function createClientWithEventHandlers(config: CamundaConfig, logger: Logger) {
   const client = new Client(config);
 
   client.on('subscribe', (topic: string) => {
-    logger.debug(`Subscribed to Camunda topic: ${topic}`);
+    logger.log(`Subscribed to Camunda topic: ${topic}`);
   });
 
   client.on('unsubscribe', (topic: string) => {
-    logger.debug(`Unsubscribed from Camunda topic: ${topic}`);
+    logger.log(`Unsubscribed from Camunda topic: ${topic}`);
   });
 
   client.on('poll:start', () => {
-    logger.debug('Camunda polling started');
+    logger.log('Camunda polling started');
   });
 
   client.on('poll:stop', () => {
-    logger.debug('Camunda polling stopped');
+    logger.log('Camunda polling stopped');
   });
 
   client.on('poll:success', (tasks: unknown[]) => {
     if (tasks && tasks.length > 0) {
-      logger.debug(`Received ${tasks.length} tasks from Camunda`);
+      logger.log(`Received ${tasks.length} tasks from Camunda`);
     }
   });
 
@@ -51,6 +51,19 @@ function createClientWithEventHandlers(config: CamundaConfig, logger: Logger) {
         baseUrl: config.baseUrl,
       });
     }
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client.on('handler:success', (task: any) => {
+    logger.log(`Handler succeeded for task [${task.id}] topic [${task.topicName}]`);
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client.on('handler:error', (error: any) => {
+    // This fires when a worker's handler throws. The error is normally silent without this listener.
+    logger.error(`Handler error: ${(error as Error)?.message ?? String(error)}`, {
+      stack: (error as Error)?.stack,
+    });
   });
 
   return client;
@@ -76,7 +89,7 @@ export function createCamundaClient(configService: ConfigService, logger: Logger
   const camundaConfig: CamundaConfig = {
     baseUrl,
     workerId: appWorkerId,
-    autoPoll: true,
+    autoPoll: false,
     maxTasks: configService.get<number>('CAMUNDA_MAX_TASKS') || 10,
     lockDuration: configService.get<number>('CAMUNDA_LOCK_DURATION') || 5_000,
     retryTimeout: configService.get<number>('CAMUNDA_RETRY_TIMEOUT') || 2_000,

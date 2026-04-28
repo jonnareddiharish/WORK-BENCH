@@ -22,9 +22,6 @@ export class MealPlanGenerationWorker extends CamundaWorker {
     // TODO: call AI meal plan service here
     // const mealPlan = await this.mealPlanService.generate(userId);
 
-    await taskService.complete(task, {
-      mealPlanGenerated: true,
-      // mealPlanId: mealPlan.id,
-    });
+    await this.completeTask(taskService, task, { mealPlanGenerated: true });
   }
 }

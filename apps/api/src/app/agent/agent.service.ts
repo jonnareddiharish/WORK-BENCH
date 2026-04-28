@@ -10,7 +10,8 @@ import { HuggingFaceTransformersEmbeddings } from '@langchain/community/embeddin
 import { StateGraph, START, END } from '@langchain/langgraph';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { BaseMessage, HumanMessage, SystemMessage, MessageContentImageUrl } from '@langchain/core/messages';
-import pdfParse from 'pdf-parse';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const pdfParse = require('pdf-parse/lib/pdf-parse') as (buffer: Buffer, options?: Record<string, unknown>) => Promise<{ text: string }>;
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { HealthEvent, HealthEventDocument } from '../health-events/health-event.schema';

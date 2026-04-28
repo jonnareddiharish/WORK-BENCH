@@ -2,6 +2,9 @@ import { Logger } from '@nestjs/common';
 
 import { CAMUNDA_TOPICS_CONFIG } from './camunda-topics.config';
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Variables: CamundaVariablesClass } = require('camunda-external-task-client-js');
+
 // Variable names used to pass retry config via Camunda process variables
 const RETRY_COUNT_VARIABLE = 'retryCount';
 const RETRY_TIMEOUT_VARIABLE = 'retryTimeout';
@@ -96,6 +99,32 @@ export default abstract class CamundaWorker {
       return entry?.[1].options?.retryTimeoutMs ?? this.retryTimeoutMs;
     } catch {
       return this.retryTimeoutMs;
+    }
+  }
+
+  /**
+   * Complete a Camunda task and set process-scope output variables.
+   *
+   * Use this instead of `taskService.complete(task, plainObject)`.
+   * The library's TaskService.complete() only processes variables that are
+   * `instanceof Variables` (from camunda-external-task-client-js); plain objects
+   * are silently ignored, leaving downstream tasks without their expected variables.
+   */
+  protected async completeTask(
+    taskService: CamundaTaskService,
+    task: CamundaTask,
+    outputVariables?: Record<string, unknown>,
+  ): Promise<void> {
+    if (outputVariables && Object.keys(outputVariables).length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const vars = new CamundaVariablesClass() as any;
+      for (const [key, value] of Object.entries(outputVariables)) {
+        vars.set(key, value);
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (taskService as any).complete(task, vars);
+    } else {
+      await taskService.complete(task);
     }
   }
 

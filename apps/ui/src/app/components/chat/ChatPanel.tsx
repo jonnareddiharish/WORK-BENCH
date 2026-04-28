@@ -3,16 +3,33 @@ import {
   BrainCircuit, ChevronRight, Paperclip, FileScan,
   Cpu, Zap, Wind, X, Settings, CheckCircle2, Star,
 } from 'lucide-react';
-import { API_BASE } from '../../lib/api';
 import { getDefaultModel, saveDefaultModel } from '../../lib/modelPreference';
 import type { ChatMessage, ChatModelId } from '../../types';
 
-const MODELS: { id: ChatModelId; label: string; provider: string; description: string; icon: typeof Cpu; activeClass: string; ring: string }[] = [
-  { id: 'claude-sonnet-4-6',       label: 'Claude Sonnet 4.6', provider: 'Anthropic', description: 'Best accuracy for medical reasoning, medication analysis, and report parsing.', icon: BrainCircuit, activeClass: 'bg-violet-100 text-violet-700 border-violet-300', ring: 'ring-violet-300 border-violet-200' },
-  { id: 'gpt-4o-mini',             label: 'GPT-4o mini',        provider: 'OpenAI',    description: 'Fast and capable. Good for general health questions and diet recommendations.', icon: Cpu,          activeClass: 'bg-emerald-100 text-emerald-700 border-emerald-300', ring: 'ring-emerald-300 border-emerald-200' },
+const STREAMER_BASE = 'http://localhost:3001';
+
+const MODELS: {
+  id: ChatModelId; label: string; provider: string;
+  description: string; icon: typeof Cpu;
+  activeClass: string; ring: string;
+}[] = [
+  { id: 'claude-sonnet-4-6',       label: 'Claude Sonnet 4.6', provider: 'Anthropic',   description: 'Best accuracy for medical reasoning, medication analysis, and report parsing.', icon: BrainCircuit, activeClass: 'bg-violet-100 text-violet-700 border-violet-300', ring: 'ring-violet-300 border-violet-200' },
+  { id: 'gpt-4o-mini',             label: 'GPT-4o mini',        provider: 'OpenAI',      description: 'Fast and capable. Good for general health questions and diet recommendations.', icon: Cpu,          activeClass: 'bg-emerald-100 text-emerald-700 border-emerald-300', ring: 'ring-emerald-300 border-emerald-200' },
   { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B',      provider: 'Meta · Groq', description: 'Open-source model via Groq for ultra-low latency. Great for quick queries.',  icon: Zap,          activeClass: 'bg-amber-100 text-amber-700 border-amber-300',         ring: 'ring-amber-300 border-amber-200' },
-  { id: 'gemini-1.5-flash',        label: 'Gemini 1.5 Flash',   provider: 'Google',    description: 'Multimodal — can analyse images. Ideal for sharing medical scan photos.',       icon: Wind,         activeClass: 'bg-sky-100 text-sky-700 border-sky-300',                ring: 'ring-sky-300 border-sky-200' },
+  { id: 'gemini-1.5-flash',        label: 'Gemini 1.5 Flash',   provider: 'Google',      description: 'Multimodal — can analyse images. Ideal for sharing medical scan photos.',       icon: Wind,         activeClass: 'bg-sky-100 text-sky-700 border-sky-300',                ring: 'ring-sky-300 border-sky-200' },
 ];
+
+function toBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result as string;
+      resolve(result.split(',')[1] ?? '');
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 interface Props {
   userId: string;
@@ -60,64 +77,128 @@ export function ChatPanel({ userId, className = '' }: Props) {
     const fileSnap    = attachedFile;
     const previewSnap = filePreview;
     const userMsg: ChatMessage = {
-      role: 'user', content: text,
-      attachedFile: fileSnap ? { name: fileSnap.name, type: fileSnap.type, preview: previewSnap ?? undefined } : undefined,
+      role: 'user',
+      content: text,
+      attachedFile: fileSnap
+        ? { name: fileSnap.name, type: fileSnap.type, preview: previewSnap ?? undefined }
+        : undefined,
     };
-    const aiPlaceholder: ChatMessage = { role: 'ai', content: '', isStreaming: true };
-
-    setMessages(prev => [...prev, userMsg, aiPlaceholder]);
+    setMessages(prev => [...prev, userMsg, { role: 'ai', content: '', isStreaming: true }]);
     setInput('');
     clearFile();
     setSubmitting(true);
-    const historyForApi = messages.map(m => ({ role: m.role, content: m.content }));
 
     try {
+      // Determine inputType and base64-encode the file if present
+      let fileBase64: string | undefined;
+      let fileMimeType: string | undefined;
+      let inputType: 'TEXT' | 'IMAGE' | 'PDF' = 'TEXT';
+
       if (fileSnap) {
-        const form = new FormData();
-        form.append('file', fileSnap);
-        form.append('message', text);
-        form.append('history', JSON.stringify(historyForApi));
-        form.append('model', model);
-        const res = await fetch(`${API_BASE}/agent/${userId}/chat-with-file`, { method: 'POST', body: form });
-        if (res.ok) {
-          const data = await res.json();
-          setMessages(prev => [...prev.slice(0, -1), { role: 'ai', content: data.reply, intent: data.intent, retrievedCount: data.retrievedCount, model: data.model, isStreaming: false }]);
-        }
-      } else {
-        const res = await fetch(`${API_BASE}/agent/${userId}/chat/stream`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, history: historyForApi, model }),
-        });
-        if (!res.ok || !res.body) throw new Error('Stream failed');
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const parts = buffer.split('\n\n');
-          buffer = parts.pop() ?? '';
-          for (const part of parts) {
-            if (!part.trim()) continue;
-            let eventType = 'message', eventData = '';
-            for (const line of part.split('\n')) {
-              if (line.startsWith('event: ')) eventType = line.slice(7).trim();
-              else if (line.startsWith('data: ')) eventData = line.slice(6);
-            }
-            if (!eventData) continue;
-            try {
-              const data = JSON.parse(eventData);
-              if (eventType === 'node')  setMessages(prev => { const u = [...prev]; u[u.length - 1] = { ...u[u.length - 1], streamingStep: data.label }; return u; });
-              else if (eventType === 'token') setMessages(prev => { const u = [...prev]; const last = u[u.length - 1]; u[u.length - 1] = { ...last, content: (last.content ?? '') + data.token }; return u; });
-              else if (eventType === 'done')  setMessages(prev => { const u = [...prev]; u[u.length - 1] = { ...u[u.length - 1], isStreaming: false, streamingStep: undefined, intent: data.intent, retrievedCount: data.retrievedCount, model: data.model }; return u; });
-              else if (eventType === 'error') setMessages(prev => { const u = [...prev]; u[u.length - 1] = { role: 'ai', content: data.message || 'An error occurred.', isStreaming: false }; return u; });
-            } catch { /* ignore */ }
+        fileMimeType = fileSnap.type;
+        inputType    = fileSnap.type.startsWith('image/') ? 'IMAGE' : 'PDF';
+        fileBase64   = await toBase64(fileSnap);
+      }
+
+      // Step 1: create session + start Camunda process
+      const startRes = await fetch(`${STREAMER_BASE}/stream/${userId}/chat`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message:      text || 'Please analyse the attached document.',
+          inputType,
+          fileBase64,
+          fileMimeType,
+          modelId: model,
+        }),
+      });
+      if (!startRes.ok) throw new Error('Failed to start session');
+      const { sessionId } = (await startRes.json()) as { sessionId: string };
+
+      // Step 2: consume SSE stream
+      const sseRes = await fetch(`${STREAMER_BASE}/stream/${sessionId}/sse`);
+      if (!sseRes.ok || !sseRes.body) throw new Error('SSE connection failed');
+
+      const reader  = sseRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() ?? '';
+
+        for (const part of parts) {
+          if (!part.trim()) continue;
+          let eventType = 'message';
+          let eventData = '';
+          for (const line of part.split('\n')) {
+            if (line.startsWith('event: '))      eventType = line.slice(7).trim();
+            else if (line.startsWith('data: '))  eventData = line.slice(6);
           }
+          if (!eventData) continue;
+
+          try {
+            const data = JSON.parse(eventData) as Record<string, unknown>;
+
+            if (eventType === 'step') {
+              if (data['status'] === 'processing') {
+                setMessages(prev => {
+                  const u = [...prev];
+                  u[u.length - 1] = { ...u[u.length - 1], streamingStep: data['label'] as string };
+                  return u;
+                });
+              } else if (data['status'] === 'done') {
+                setMessages(prev => {
+                  const u = [...prev];
+                  u[u.length - 1] = { ...u[u.length - 1], streamingStep: undefined };
+                  return u;
+                });
+              }
+
+            } else if (eventType === 'token') {
+              setMessages(prev => {
+                const u    = [...prev];
+                const last = u[u.length - 1];
+                u[u.length - 1] = { ...last, content: (last.content ?? '') + (data['content'] as string) };
+                return u;
+              });
+
+            } else if (eventType === 'done') {
+              setMessages(prev => {
+                const u = [...prev];
+                u[u.length - 1] = {
+                  ...u[u.length - 1],
+                  content:       (data['content'] as string) ?? u[u.length - 1].content,
+                  isStreaming:   false,
+                  streamingStep: undefined,
+                  intent:        (data['intent'] as string[]) ?? [],
+                  model,
+                };
+                return u;
+              });
+
+            } else if (eventType === 'error') {
+              setMessages(prev => {
+                const u = [...prev];
+                u[u.length - 1] = {
+                  role: 'ai',
+                  content:     (data['error'] as string) || 'An error occurred. Please try again.',
+                  isStreaming: false,
+                };
+                return u;
+              });
+            }
+          } catch { /* malformed SSE frame — skip */ }
         }
       }
     } catch {
-      setMessages(prev => [...prev.slice(0, -1), { role: 'ai', content: 'Something went wrong. Please try again.', isStreaming: false }]);
+      setMessages(prev => [
+        ...prev.slice(0, -1),
+        { role: 'ai', content: 'Something went wrong. Please try again.', isStreaming: false },
+      ]);
     } finally {
       setSubmitting(false);
     }
@@ -157,7 +238,7 @@ export function ChatPanel({ userId, className = '' }: Props) {
         </div>
       </div>
 
-      {/* ── Settings panel ── */}
+      {/* ── Model settings panel ── */}
       {settingsOpen && (
         <div className="flex-1 overflow-y-auto p-5 bg-slate-50 min-h-0">
           <div className="flex items-center justify-between mb-4">
@@ -171,8 +252,8 @@ export function ChatPanel({ userId, className = '' }: Props) {
           </div>
           <div className="space-y-2.5">
             {MODELS.map(m => {
-              const Icon = m.icon;
-              const active = model === m.id;
+              const Icon      = m.icon;
+              const active    = model === m.id;
               const isDefault = defaultModel === m.id;
               const justSaved = savedPulse === m.id;
               return (
@@ -218,36 +299,57 @@ export function ChatPanel({ userId, className = '' }: Props) {
                 <BrainCircuit className="w-8 h-8 text-indigo-400" />
               </div>
               <h4 className="text-base font-bold text-slate-700 mb-1.5">How can I help today?</h4>
-              <p className="text-xs text-slate-400 leading-relaxed">Ask about your medications, diet recommendations, or share a medical report.</p>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Ask about your medications, diet recommendations, or share a medical report for analysis.
+              </p>
             </div>
           ) : (
             messages.map((msg, idx) => (
               <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-                {msg.role === 'ai' && !msg.isStreaming && (msg.intent?.length || msg.retrievedCount != null) && (
+
+                {/* Intent badges on completed AI messages */}
+                {msg.role === 'ai' && !msg.isStreaming && (msg.intent?.length ?? 0) > 0 && (
                   <div className="flex flex-wrap gap-1.5 mb-1.5 px-1">
-                    {msg.model && (() => { const m = MODELS.find(cm => cm.id === msg.model); return m ? <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${m.activeClass}`}>{m.label}</span> : null; })()}
-                    {(msg.intent || []).filter(i => i !== 'OTHER' && i !== 'QUERY').map(i => (
-                      <span key={i} className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-600 uppercase tracking-wide">{i.replace(/_/g, ' ')}</span>
+                    {msg.model && (() => {
+                      const m = MODELS.find(cm => cm.id === msg.model);
+                      return m ? (
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${m.activeClass}`}>{m.label}</span>
+                      ) : null;
+                    })()}
+                    {(msg.intent ?? []).filter(i => i !== 'OTHERS').map(i => (
+                      <span key={i} className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-600 uppercase tracking-wide">
+                        {i.replace(/_/g, ' ')}
+                      </span>
                     ))}
-                    {msg.retrievedCount != null && msg.retrievedCount > 0 && (
-                      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-600">{msg.retrievedCount} records retrieved</span>
-                    )}
                   </div>
                 )}
+
+                {/* Streaming step label */}
                 {msg.role === 'ai' && msg.isStreaming && msg.streamingStep && (
                   <span className="flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 mb-1.5 rounded-full bg-indigo-50 text-indigo-500 border border-indigo-100">
-                    <span className="flex gap-0.5">{[0,150,300].map(d => <span key={d} className="w-1 h-1 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />)}</span>
+                    <span className="flex gap-0.5">
+                      {[0, 150, 300].map(d => (
+                        <span key={d} className="w-1 h-1 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />
+                      ))}
+                    </span>
                     {msg.streamingStep}
                   </span>
                 )}
+
+                {/* File attachment preview */}
                 {msg.attachedFile && (
                   <div className="mb-1.5 max-w-[75%]">
                     {msg.attachedFile.preview
                       ? <img src={msg.attachedFile.preview} alt={msg.attachedFile.name} className="rounded-2xl rounded-tr-none max-h-40 object-cover border border-indigo-200 shadow-sm" />
-                      : <div className="flex items-center gap-2 px-3 py-2 bg-indigo-500 text-white rounded-2xl rounded-tr-none text-xs font-medium"><FileScan className="w-3.5 h-3.5 flex-shrink-0" /><span className="truncate max-w-[140px]">{msg.attachedFile.name}</span></div>
+                      : <div className="flex items-center gap-2 px-3 py-2 bg-indigo-500 text-white rounded-2xl rounded-tr-none text-xs font-medium">
+                          <FileScan className="w-3.5 h-3.5 flex-shrink-0" />
+                          <span className="truncate max-w-[140px]">{msg.attachedFile.name}</span>
+                        </div>
                     }
                   </div>
                 )}
+
+                {/* Message bubble */}
                 {(msg.content || (msg.role === 'ai' && msg.isStreaming)) && (
                   <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm shadow-sm whitespace-pre-wrap leading-relaxed ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white text-slate-800 border border-slate-100 rounded-tl-none'}`}>
                     {msg.content}
@@ -261,7 +363,7 @@ export function ChatPanel({ userId, className = '' }: Props) {
         </div>
       )}
 
-      {/* ── Input ── */}
+      {/* ── Input area ── */}
       <div className="flex-shrink-0 border-t border-slate-100 bg-white">
         {attachedFile && (
           <div className="px-4 pt-3 pb-0">
@@ -272,27 +374,42 @@ export function ChatPanel({ userId, className = '' }: Props) {
               }
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-bold text-indigo-700 truncate">{attachedFile.name}</p>
-                <p className="text-[10px] text-indigo-400">{attachedFile.type.startsWith('image/') ? 'Image — Claude Vision will extract medical data' : 'PDF — text will be extracted and analysed'}</p>
+                <p className="text-[10px] text-indigo-400">
+                  {attachedFile.type.startsWith('image/')
+                    ? 'Image — vision will extract all medical data'
+                    : 'PDF — text will be extracted and analysed'}
+                </p>
               </div>
-              <button onClick={clearFile} className="p-1 hover:bg-indigo-100 rounded-lg transition-colors text-indigo-400"><X className="w-3.5 h-3.5" /></button>
+              <button onClick={clearFile} className="p-1 hover:bg-indigo-100 rounded-lg transition-colors text-indigo-400">
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           </div>
         )}
         <div className="p-3.5 flex items-center gap-2.5">
           <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf" className="hidden" onChange={handleFileChange} />
-          <button onClick={() => fileRef.current?.click()} disabled={submitting} title="Attach image or PDF"
-            className={`p-2.5 rounded-xl transition-all flex-shrink-0 ${attachedFile ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'} disabled:opacity-40`}>
+          <button
+            onClick={() => fileRef.current?.click()}
+            disabled={submitting}
+            title="Attach image or PDF"
+            className={`p-2.5 rounded-xl transition-all flex-shrink-0 ${attachedFile ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-400 hover:bg-indigo-50 hover:text-indigo-500'} disabled:opacity-40`}
+          >
             <Paperclip className="w-3.5 h-3.5" />
           </button>
           <input
-            ref={inputRef} type="text" value={input}
+            ref={inputRef}
+            type="text"
+            value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSend()}
             placeholder={attachedFile ? 'Add a note (optional)...' : 'Ask your AI health agent...'}
             className="flex-1 px-4 py-2.5 bg-slate-50 rounded-2xl text-sm text-slate-800 placeholder:text-slate-400 focus:ring-2 focus:ring-indigo-200 focus:bg-white focus:outline-none transition-all"
           />
-          <button onClick={handleSend} disabled={submitting || (!input.trim() && !attachedFile)}
-            className="p-3 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all shadow-md shadow-indigo-200 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0">
+          <button
+            onClick={handleSend}
+            disabled={submitting || (!input.trim() && !attachedFile)}
+            className="p-3 bg-indigo-600 text-white rounded-2xl hover:bg-indigo-700 transition-all shadow-md shadow-indigo-200 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
+          >
             <ChevronRight className="w-4 h-4" />
           </button>
         </div>
