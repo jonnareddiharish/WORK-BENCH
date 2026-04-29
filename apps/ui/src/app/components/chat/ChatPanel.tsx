@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
 import {
   BrainCircuit, ChevronRight, Paperclip, FileScan,
-  Cpu, Zap, Wind, X, Settings, CheckCircle2, Star,
+  Cpu, Zap, Wind, X, Settings, CheckCircle2, Star, Loader2,
 } from 'lucide-react';
 import { getDefaultModel, saveDefaultModel } from '../../lib/modelPreference';
-import type { ChatMessage, ChatModelId } from '../../types';
+import type { ChatMessage, ChatStep, ChatModelId } from '../../types';
 
 const STREAMER_BASE = 'http://localhost:3001';
 
@@ -89,7 +89,6 @@ export function ChatPanel({ userId, className = '' }: Props) {
     setSubmitting(true);
 
     try {
-      // Determine inputType and base64-encode the file if present
       let fileBase64: string | undefined;
       let fileMimeType: string | undefined;
       let inputType: 'TEXT' | 'IMAGE' | 'PDF' = 'TEXT';
@@ -123,68 +122,86 @@ export function ChatPanel({ userId, className = '' }: Props) {
       const decoder = new TextDecoder();
       let buffer = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+      const processSSEChunk = (chunk: string) => {
+        buffer += chunk;
         const parts = buffer.split('\n\n');
         buffer = parts.pop() ?? '';
 
         for (const part of parts) {
           if (!part.trim()) continue;
-          let eventType = 'message';
+          // parse `event:` and `data:` lines; fallback to reading `type` from the JSON
+          let eventType = '';
           let eventData = '';
           for (const line of part.split('\n')) {
-            if (line.startsWith('event: '))      eventType = line.slice(7).trim();
-            else if (line.startsWith('data: '))  eventData = line.slice(6);
+            const trimmed = line.trimEnd();
+            if (trimmed.startsWith('event:')) eventType = trimmed.slice(6).trim();
+            else if (trimmed.startsWith('data:')) eventData = trimmed.slice(5).trim();
           }
           if (!eventData) continue;
 
           try {
             const data = JSON.parse(eventData) as Record<string, unknown>;
+            // fallback: use the type field embedded in the JSON payload
+            const type = eventType || (data['type'] as string) || '';
 
-            if (eventType === 'step') {
-              if (data['status'] === 'processing') {
+            if (type === 'step') {
+              const label  = data['label'] as string;
+              const status = data['status'] as string;
+              if (status === 'processing') {
                 setMessages(prev => {
-                  const u = [...prev];
-                  u[u.length - 1] = { ...u[u.length - 1], streamingStep: data['label'] as string };
+                  const u    = [...prev];
+                  const last = u[u.length - 1];
+                  const steps: ChatStep[] = [...(last.steps ?? []), { label, done: false }];
+                  u[u.length - 1] = { ...last, steps };
                   return u;
                 });
-              } else if (data['status'] === 'done') {
+              } else if (status === 'done') {
                 setMessages(prev => {
-                  const u = [...prev];
-                  u[u.length - 1] = { ...u[u.length - 1], streamingStep: undefined };
+                  const u    = [...prev];
+                  const last = u[u.length - 1];
+                  // mark the last matching in-progress step as done
+                  const steps: ChatStep[] = (last.steps ?? []).map(s =>
+                    s.label === label && !s.done ? { ...s, done: true } : s,
+                  );
+                  u[u.length - 1] = { ...last, steps };
                   return u;
                 });
               }
 
-            } else if (eventType === 'token') {
+            } else if (type === 'token') {
               setMessages(prev => {
                 const u    = [...prev];
                 const last = u[u.length - 1];
-                u[u.length - 1] = { ...last, content: (last.content ?? '') + (data['content'] as string) };
+                u[u.length - 1] = { ...last, content: (last.content ?? '') + (data['content'] as string ?? '') };
                 return u;
               });
 
-            } else if (eventType === 'done') {
+            } else if (type === 'done') {
               setMessages(prev => {
-                const u = [...prev];
+                const u    = [...prev];
+                const last = u[u.length - 1];
+                // mark any remaining in-progress steps as done
+                const steps: ChatStep[] = (last.steps ?? []).map(s => ({ ...s, done: true }));
                 u[u.length - 1] = {
-                  ...u[u.length - 1],
-                  content:       (data['content'] as string) ?? u[u.length - 1].content,
-                  isStreaming:   false,
-                  streamingStep: undefined,
-                  intent:        (data['intent'] as string[]) ?? [],
+                  ...last,
+                  steps,
+                  // prefer the full accumulated content from the done event; fall back to streamed tokens
+                  content:     (data['content'] as string) || last.content,
+                  isStreaming: false,
+                  intent:      (data['intent'] as string[]) ?? [],
                   model,
                 };
                 return u;
               });
 
-            } else if (eventType === 'error') {
+            } else if (type === 'error') {
               setMessages(prev => {
-                const u = [...prev];
+                const u    = [...prev];
+                const last = u[u.length - 1];
+                const steps: ChatStep[] = (last.steps ?? []).map(s => ({ ...s, done: true }));
                 u[u.length - 1] = {
-                  role: 'ai',
+                  ...last,
+                  steps,
                   content:     (data['error'] as string) || 'An error occurred. Please try again.',
                   isStreaming: false,
                 };
@@ -193,7 +210,29 @@ export function ChatPanel({ userId, className = '' }: Props) {
             }
           } catch { /* malformed SSE frame — skip */ }
         }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) processSSEChunk(decoder.decode(value, { stream: true }));
+        if (done) {
+          // flush any remaining buffered data after stream closes
+          processSSEChunk(decoder.decode());
+          break;
+        }
       }
+
+      // if the stream closed without a done event (e.g. timeout), stop the spinner
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'ai' && last.isStreaming) {
+          return [
+            ...prev.slice(0, -1),
+            { ...last, isStreaming: false, steps: (last.steps ?? []).map(s => ({ ...s, done: true })) },
+          ];
+        }
+        return prev;
+      });
     } catch {
       setMessages(prev => [
         ...prev.slice(0, -1),
@@ -324,16 +363,26 @@ export function ChatPanel({ userId, className = '' }: Props) {
                   </div>
                 )}
 
-                {/* Streaming step label */}
-                {msg.role === 'ai' && msg.isStreaming && msg.streamingStep && (
-                  <span className="flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 mb-1.5 rounded-full bg-indigo-50 text-indigo-500 border border-indigo-100">
-                    <span className="flex gap-0.5">
-                      {[0, 150, 300].map(d => (
-                        <span key={d} className="w-1 h-1 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />
-                      ))}
-                    </span>
-                    {msg.streamingStep}
-                  </span>
+                {/* Processing steps — persist as history with done/active states */}
+                {msg.role === 'ai' && (msg.steps?.length ?? 0) > 0 && (
+                  <div className="flex flex-col gap-1 mb-2">
+                    {msg.steps!.map((step, si) => (
+                      <span
+                        key={si}
+                        className={`flex items-center gap-1.5 text-[10px] font-semibold px-2.5 py-1 rounded-full border w-fit transition-all ${
+                          step.done
+                            ? 'bg-emerald-50 text-emerald-600 border-emerald-100'
+                            : 'bg-indigo-50 text-indigo-500 border-indigo-100'
+                        }`}
+                      >
+                        {step.done
+                          ? <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
+                          : <Loader2 className="w-3 h-3 flex-shrink-0 animate-spin" />
+                        }
+                        {step.label}
+                      </span>
+                    ))}
+                  </div>
                 )}
 
                 {/* File attachment preview */}
@@ -349,11 +398,16 @@ export function ChatPanel({ userId, className = '' }: Props) {
                   </div>
                 )}
 
-                {/* Message bubble */}
+                {/* Message bubble — show when there's content, or while still streaming with no steps yet */}
                 {(msg.content || (msg.role === 'ai' && msg.isStreaming)) && (
                   <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm shadow-sm whitespace-pre-wrap leading-relaxed ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white text-slate-800 border border-slate-100 rounded-tl-none'}`}>
-                    {msg.content}
-                    {msg.isStreaming && <span className="inline-block w-[2px] h-[1em] bg-indigo-400 ml-0.5 align-middle animate-pulse" />}
+                    {msg.content || (msg.isStreaming && !msg.steps?.length
+                      ? <span className="text-slate-400 italic text-xs">Thinking...</span>
+                      : null
+                    )}
+                    {msg.isStreaming && msg.content && (
+                      <span className="inline-block w-[2px] h-[1em] bg-indigo-400 ml-0.5 align-middle animate-pulse" />
+                    )}
                   </div>
                 )}
               </div>

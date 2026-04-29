@@ -167,6 +167,11 @@ export type ChatModelId =
   | 'llama-3.3-70b-versatile'
   | 'gemini-1.5-flash';
 
+export interface ChatStep {
+  label: string;
+  done: boolean;
+}
+
 export interface ChatMessage {
   role: 'user' | 'ai';
   content: string;
@@ -175,7 +180,7 @@ export interface ChatMessage {
   model?: string;
   attachedFile?: { name: string; type: string; preview?: string };
   isStreaming?: boolean;
-  streamingStep?: string;
+  steps?: ChatStep[];
 }
 
 export interface MealPreferences {

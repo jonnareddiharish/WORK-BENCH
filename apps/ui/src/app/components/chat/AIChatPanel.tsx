@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import {
   X, BrainCircuit, ChevronRight, Paperclip, FileScan,
-  Cpu, Zap, Wind,
+  Cpu, Zap, Wind, CheckCircle2, Loader2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { API_BASE } from '../../lib/api';
@@ -126,27 +126,42 @@ export function AIChatPanel({ userId, isOpen, onClose }: Props) {
               const data = JSON.parse(eventData);
               if (eventType === 'node') {
                 setMessages(prev => {
-                  const u = [...prev];
-                  u[u.length - 1] = { ...u[u.length - 1], streamingStep: data.label };
+                  const u    = [...prev];
+                  const last = u[u.length - 1];
+                  u[u.length - 1] = { ...last, steps: [...(last.steps ?? []), { label: data.label as string, done: false }] };
                   return u;
                 });
               } else if (eventType === 'token') {
                 setMessages(prev => {
-                  const u = [...prev];
+                  const u    = [...prev];
                   const last = u[u.length - 1];
-                  u[u.length - 1] = { ...last, content: (last.content ?? '') + data.token };
+                  u[u.length - 1] = { ...last, content: (last.content ?? '') + (data.token as string) };
                   return u;
                 });
               } else if (eventType === 'done') {
                 setMessages(prev => {
-                  const u = [...prev];
-                  u[u.length - 1] = { ...u[u.length - 1], isStreaming: false, streamingStep: undefined, intent: data.intent, retrievedCount: data.retrievedCount, model: data.model };
+                  const u    = [...prev];
+                  const last = u[u.length - 1];
+                  u[u.length - 1] = {
+                    ...last,
+                    isStreaming: false,
+                    steps: (last.steps ?? []).map(s => ({ ...s, done: true })),
+                    intent: data.intent as string[],
+                    retrievedCount: data.retrievedCount as number,
+                    model: data.model as string,
+                  };
                   return u;
                 });
               } else if (eventType === 'error') {
                 setMessages(prev => {
-                  const u = [...prev];
-                  u[u.length - 1] = { role: 'ai', content: data.message || 'An error occurred.', isStreaming: false };
+                  const u    = [...prev];
+                  const last = u[u.length - 1];
+                  u[u.length - 1] = {
+                    ...last,
+                    steps: (last.steps ?? []).map(s => ({ ...s, done: true })),
+                    content: (data.message as string) || 'An error occurred.',
+                    isStreaming: false,
+                  };
                   return u;
                 });
               }
@@ -250,17 +265,15 @@ export function AIChatPanel({ userId, isOpen, onClose }: Props) {
                       </div>
                     )}
 
-                    {/* Live step pill */}
-                    {msg.role === 'ai' && msg.isStreaming && msg.streamingStep && (
-                      <div className="flex items-center gap-1.5 mb-1.5 px-1">
-                        <span className="flex items-center gap-1.5 text-[10px] font-bold px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-500 border border-indigo-100">
-                          <span className="flex gap-0.5">
-                            {[0, 150, 300].map(d => (
-                              <span key={d} className="w-1 h-1 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: `${d}ms` }} />
-                            ))}
+                    {/* Processing steps history */}
+                    {msg.role === 'ai' && (msg.steps?.length ?? 0) > 0 && (
+                      <div className="flex flex-col gap-1 mb-1.5 px-1">
+                        {msg.steps!.map((step, si) => (
+                          <span key={si} className={`flex items-center gap-1.5 text-[10px] font-semibold px-2.5 py-1 rounded-full border w-fit ${step.done ? 'bg-emerald-50 text-emerald-600 border-emerald-100' : 'bg-indigo-50 text-indigo-500 border-indigo-100'}`}>
+                            {step.done ? <CheckCircle2 className="w-3 h-3 flex-shrink-0" /> : <Loader2 className="w-3 h-3 flex-shrink-0 animate-spin" />}
+                            {step.label}
                           </span>
-                          {msg.streamingStep}
-                        </span>
+                        ))}
                       </div>
                     )}
 
